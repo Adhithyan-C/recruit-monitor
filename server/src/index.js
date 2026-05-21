@@ -8,7 +8,6 @@ import { config } from './config.js';
 import authRoutes from './routes/auth.js';
 import roomRoutes from './routes/rooms.js';
 import { setupSockets } from './socket/index.js';
-import { initDatabase } from './db/database.js';
 
 // Validate critical env vars
 if (!config.jwtSecret) {
@@ -20,6 +19,7 @@ if (!config.clientOrigin) {
 }
 
 const app = express();
+const allowedOrigins = [config.clientOrigin, config.clientOriginProd].filter(Boolean);
 
 // Security middleware
 app.use(helmet());
@@ -56,16 +56,7 @@ setupSockets(httpServer, {
   }
 });
 
-// Initialize DB and start server
-initDatabase()
-  .then(() => {
-    httpServer.listen(config.port, () => {
-      console.log(`Server running on port ${config.port}`);
-      console.log(`Client origin: ${config.clientOrigin}`);
-      console.log('Database initialized (SQLite WAL mode)');
-    });
-  })
-  .catch((err) => {
-    console.error('Failed to initialize server:', err);
-    process.exit(1);
-  });
+httpServer.listen(config.port, () => {
+  console.log(`Server running on port ${config.port}`);
+  console.log(`Allowed origins: ${allowedOrigins.join(', ')}`);
+});
