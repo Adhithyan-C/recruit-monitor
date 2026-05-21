@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { randomInt } from 'crypto';
 
 // ── In-memory room state ─────────────────────────────────────────────
 const rooms = new Map();    // Map<roomId, ActiveRoom>
@@ -12,7 +13,7 @@ function generateRoomCode() {
   do {
     code = '';
     for (let i = 0; i < 6; i++) {
-      code += CODE_CHARS.charAt(Math.floor(Math.random() * CODE_CHARS.length));
+      code += CODE_CHARS.charAt(randomInt(CODE_CHARS.length));
     }
   } while (codes.has(code)); // collision check
   return code;

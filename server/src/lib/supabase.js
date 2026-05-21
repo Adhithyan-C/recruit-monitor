@@ -1,31 +1,17 @@
 import { createClient } from '@supabase/supabase-js';
 import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
 
-/* =========================
-   VALIDATE ENV VARIABLES
-========================= */
+const missingSupabaseConfig = [
+  ['SUPABASE_URL', config.supabase.url],
+  ['SUPABASE_ANON_KEY', config.supabase.anonKey],
+  ['SUPABASE_SERVICE_ROLE_KEY', config.supabase.serviceRoleKey],
+].filter(([, value]) => !value).map(([key]) => key);
 
-const requiredEnvVars = [
-  'SUPABASE_URL',
-  'SUPABASE_ANON_KEY',
-  'SUPABASE_SERVICE_ROLE_KEY'
-];
-
-const missingVars = requiredEnvVars.filter((key) => {
-  return !process.env[key];
-});
-
-if (missingVars.length > 0) {
-  console.error(
-    `ERROR: Missing Supabase environment variables: ${missingVars.join(', ')}`
-  );
-
-  throw new Error('Supabase configuration invalid');
+if (missingSupabaseConfig.length > 0) {
+  logger.error('missing required Supabase environment variables', { variables: missingSupabaseConfig });
+  process.exit(1);
 }
-
-/* =========================
-   SHARED CLIENT OPTIONS
-========================= */
 
 const clientOptions = {
   auth: {
@@ -35,36 +21,14 @@ const clientOptions = {
   },
 };
 
-/* =========================
-   PUBLIC AUTH CLIENT
-   Uses publishable/anon key
-========================= */
-
 export const supabaseAuth = createClient(
   config.supabase.url,
   config.supabase.anonKey,
   clientOptions
 );
 
-/* =========================
-   ADMIN CLIENT
-   Uses service role key
-========================= */
-
 export const supabaseAdmin = createClient(
   config.supabase.url,
   config.supabase.serviceRoleKey,
   clientOptions
 );
-
-/* =========================
-   DEFAULT EXPORTS
-========================= */
-
-// General auth operations
-export const supabase = supabaseAuth;
-
-// Admin-level operations
-export const supabaseService = supabaseAdmin;
-
-console.log('Supabase clients initialized successfully');

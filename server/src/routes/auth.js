@@ -1,12 +1,21 @@
 import express from 'express';
-import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
 import { supabaseAuth } from '../lib/supabase.js';
-import { config } from '../config.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/authMiddleware.js';
+import { generateToken } from '../utils/generateToken.js';
+import { logger } from '../utils/logger.js';
 
 const router = express.Router();
 
-router.post('/login', async (req, res) => {
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.post('/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -14,14 +23,14 @@ router.post('/login', async (req, res) => {
   }
 
   try {
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = String(email).trim().toLowerCase();
     const { data, error } = await supabaseAuth.auth.signInWithPassword({
       email: normalizedEmail,
       password,
     });
 
     if (error || !data?.user) {
-      console.warn(`[Auth] Failed login attempt for: ${normalizedEmail}`);
+      logger.warn('login failed');
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -30,35 +39,32 @@ router.post('/login', async (req, res) => {
     const name = supabaseUser.user_metadata?.name;
 
     if (!role || !['interviewer', 'supervisor'].includes(role)) {
-      console.warn(`[Auth] Login rejected - no valid role for user: ${normalizedEmail}`);
+      logger.warn('login rejected - no valid role');
       return res.status(403).json({ error: 'Access denied. Your account does not have platform access.' });
     }
 
     const resolvedName = name || normalizedEmail.split('@')[0];
-    const token = jwt.sign(
-      {
-        userId: supabaseUser.id,
-        email: supabaseUser.email,
-        role,
-        name: resolvedName,
-      },
-      config.jwtSecret,
-      { expiresIn: '8h' }
-    );
+    const token = generateToken({
+      userId: supabaseUser.id,
+      email: supabaseUser.email,
+      role,
+      name: resolvedName,
+    });
 
-    console.log(`[Auth] Successful login: ${normalizedEmail} (${role})`);
+    logger.info('login successful', { role });
 
     return res.json({
+      success: true,
       token,
       user: {
-        userId: supabaseUser.id,
+        id: supabaseUser.id,
         email: supabaseUser.email,
         role,
         name: resolvedName,
       },
     });
   } catch (err) {
-    console.error('[Auth] Login error:', err.message);
+    logger.error('login error', { reason: err.message });
     return res.status(500).json({ error: 'Authentication service unavailable' });
   }
 });

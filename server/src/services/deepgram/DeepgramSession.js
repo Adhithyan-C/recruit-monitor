@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { config } from '../../config.js';
+import { logger } from '../../utils/logger.js';
 
 export const MAX_AUDIO_CHUNK_SIZE = 32768;    // 32 KB max per chunk
 export const MAX_BUFFERED_CHUNKS  = 50;       // bounded queue depth limit
@@ -32,7 +33,7 @@ export class DeepgramSession extends EventEmitter {
     if (old === newState) return;
     this._state = newState;
     this.emit('stateChange', { from: old, to: newState, roomId: this.roomId });
-    console.log(`[DG:${this.roomId.slice(0, 8)}] ${old} -> ${newState}`);
+    logger.info('deepgram state changed', { roomId: this.roomId, from: old, to: newState });
   }
 
   get state() { return this._state; }
@@ -65,7 +66,7 @@ export class DeepgramSession extends EventEmitter {
     ws.on('message', (raw) => { this._handleMessage(raw); });
     ws.on('pong', () => { this._lastPongReceived = Date.now(); });
     ws.on('error', (err) => {
-      console.warn(`[DG:${this.roomId.slice(0, 8)}] WS error:`, err.message);
+      logger.warn('deepgram websocket error', { roomId: this.roomId, reason: err.message });
     });
     ws.on('close', (code, reason) => { this._handleClose(code, reason); });
   }
@@ -83,7 +84,7 @@ export class DeepgramSession extends EventEmitter {
       const transcriptStale = (now - this._lastTranscriptReceived) > INACTIVITY_TIMEOUT_MS;
       if (pongStale || transcriptStale) {
         const reason = pongStale ? 'no pong' : 'transcript inactivity';
-        console.warn(`[DG:${this.roomId.slice(0, 8)}] Stale detected (${reason}), reconnecting`);
+        logger.warn('deepgram stale detected', { roomId: this.roomId, reason });
         this._reconnect();
       }
     }, KEEPALIVE_INTERVAL_MS);
@@ -102,7 +103,7 @@ export class DeepgramSession extends EventEmitter {
     try {
       data = JSON.parse(raw);
     } catch (err) {
-      console.warn(`[DG:${this.roomId.slice(0, 8)}] Ignoring non-JSON message:`, err.message);
+      logger.warn('deepgram ignored non-json message', { roomId: this.roomId, reason: err.message });
       return;
     }
 
@@ -139,7 +140,7 @@ export class DeepgramSession extends EventEmitter {
       this._queue.push(chunk);
       this._droppedChunks++;
       if (this._droppedChunks % 100 === 1) {
-        console.warn(`[DG:${this.roomId.slice(0, 8)}] Backpressure: ${this._droppedChunks} total chunks dropped`);
+        logger.warn('deepgram backpressure', { roomId: this.roomId, droppedChunks: this._droppedChunks });
       }
     }
   }
@@ -176,13 +177,18 @@ export class DeepgramSession extends EventEmitter {
       try {
         this.ws.close(1000);
       } catch (err) {
-        console.warn(`[DG:${this.roomId.slice(0, 8)}] WS close during reconnect failed:`, err.message);
+        logger.warn('deepgram close during reconnect failed', { roomId: this.roomId, reason: err.message });
       }
       this.ws = null;
     }
     const delay = Math.min(Math.pow(2, this._retryCount) * 1000, 32000);
     this._retryCount++;
-    console.log(`[DG:${this.roomId.slice(0, 8)}] Reconnecting in ${delay}ms (attempt ${this._retryCount}/${RECONNECT_MAX_RETRIES})`);
+    logger.info('deepgram reconnect scheduled', {
+      roomId: this.roomId,
+      delay,
+      attempt: this._retryCount,
+      maxRetries: RECONNECT_MAX_RETRIES,
+    });
     this._reconnectTimeout = setTimeout(() => {
       if (!this._destroyed) this.connect();
     }, delay);
@@ -201,12 +207,12 @@ export class DeepgramSession extends EventEmitter {
           this.ws.send(JSON.stringify({ type: 'CloseStream' }));
         }
       } catch (err) {
-        console.warn(`[DG:${this.roomId.slice(0, 8)}] CloseStream send failed:`, err.message);
+        logger.warn('deepgram closestream send failed', { roomId: this.roomId, reason: err.message });
       }
       try {
         this.ws.close(1000);
       } catch (err) {
-        console.warn(`[DG:${this.roomId.slice(0, 8)}] WS close failed:`, err.message);
+        logger.warn('deepgram websocket close failed', { roomId: this.roomId, reason: err.message });
       }
       this.ws = null;
     }

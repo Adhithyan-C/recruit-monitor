@@ -1,6 +1,7 @@
 import { io } from 'socket.io-client';
 import { SOCKET_URL } from '../config.js';
 import { useAuthStore } from '../store/useAuthStore.js';
+import { tokenStorage } from '../utils/tokenStorage.js';
 
 // Module-level singletons — survive component remounts
 const sockets = {
@@ -12,7 +13,7 @@ const sockets = {
 export function getSocket(role) {
   if (sockets[role]) return sockets[role];
 
-  const token = useAuthStore.getState().token;
+  const token = useAuthStore.getState().token || tokenStorage.get();
 
   const opts = {
     autoConnect: true,
@@ -20,6 +21,18 @@ export function getSocket(role) {
   };
 
   sockets[role] = io(`${SOCKET_URL}/${role}`, opts);
+  sockets[role].on('auth:error', () => {
+    useAuthStore.getState().logout();
+    disconnectAll();
+  });
+  sockets[role].on('connect_error', (err) => {
+    if (role === 'candidate') return;
+    const message = String(err?.message || '').toLowerCase();
+    if (message.includes('token') || message.includes('auth') || message.includes('forbidden')) {
+      useAuthStore.getState().logout();
+      disconnectAll();
+    }
+  });
   return sockets[role];
 }
 

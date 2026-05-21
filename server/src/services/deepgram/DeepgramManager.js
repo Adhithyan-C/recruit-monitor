@@ -1,5 +1,6 @@
 import { DeepgramSession } from './DeepgramSession.js';
 import { config } from '../../config.js';
+import { logger } from '../../utils/logger.js';
 
 const RECONNECT_GRACE_MS = 15000;      // 15s grace on candidate disconnect
 const MAX_TRANSCRIPT_CHARS = 500000;   // ~500KB text cap
@@ -38,7 +39,7 @@ export class DeepgramManager {
     if (graceTimer) {
       clearTimeout(graceTimer);
       this._graceTimers.delete(roomId);
-      console.log(`[DGM] Grace timer cancelled for room ${roomId.slice(0, 8)} (candidate rejoined)`);
+      logger.info('deepgram grace timer cancelled', { roomId });
     }
 
     const existing = this._sessions.get(roomId);
@@ -51,7 +52,7 @@ export class DeepgramManager {
     }
 
     if (!config.deepgramApiKey) {
-      console.error('[DGM] DEEPGRAM_API_KEY not set - transcription disabled');
+      logger.error('deepgram api key missing');
       broadcastToRoom(roomId, 'transcript:error', {
         message: 'Transcription unavailable - server configuration error',
         roomId,
@@ -97,7 +98,7 @@ export class DeepgramManager {
     });
 
     session.on('error', ({ message, recoverable }) => {
-      console.error(`[DGM] Error for room ${roomId.slice(0, 8)}: ${message}`);
+      logger.error('deepgram session error', { roomId, message, recoverable });
       broadcastToRoom(roomId, 'transcript:error', { message, roomId, recoverable });
     });
 
@@ -116,10 +117,10 @@ export class DeepgramManager {
     const timer = setTimeout(() => {
       this._graceTimers.delete(roomId);
       this.stopSession(roomId);
-      console.log(`[DGM] Grace expired -> stopped session for room ${roomId.slice(0, 8)}`);
+      logger.info('deepgram grace expired', { roomId });
     }, RECONNECT_GRACE_MS);
     this._graceTimers.set(roomId, timer);
-    console.log(`[DGM] Grace started for room ${roomId.slice(0, 8)} (${RECONNECT_GRACE_MS}ms)`);
+    logger.info('deepgram grace started', { roomId, graceMs: RECONNECT_GRACE_MS });
   }
 
   stopSession(roomId) {

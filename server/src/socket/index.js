@@ -1,12 +1,14 @@
 import { Server } from 'socket.io';
 
-import { socketAuth } from '../middleware/auth.js';
+import { socketAuth } from '../middleware/authMiddleware.js';
 import * as roomRegistry from '../state/roomRegistry.js';
 
 import { setupInterviewerHandlers } from './interviewerHandlers.js';
 import { setupCandidateHandlers } from './candidateHandlers.js';
 import { setupSupervisorHandlers } from './supervisorHandlers.js';
 import { DeepgramManager } from '../services/deepgram/DeepgramManager.js';
+import { SocketRateLimiter } from '../utils/socketRateLimiter.js';
+import { logger } from '../utils/logger.js';
 
 export function setupSockets(httpServer, socketCorsConfig = {}) {
   // Create Socket.IO server
@@ -26,8 +28,8 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
   const supervisorNS = io.of('/supervisor');
 
   // JWT auth middleware
-  interviewerNS.use(socketAuth);
-  supervisorNS.use(socketAuth);
+  interviewerNS.use(socketAuth('interviewer'));
+  supervisorNS.use(socketAuth('supervisor'));
 
   // Candidate namespace intentionally has NO JWT auth
   // Room code acts as temporary credential
@@ -77,6 +79,7 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
   // Deepgram session manager
   // ─────────────────────────────────────────────────────────────
   const deepgramManager = new DeepgramManager();
+  const rateLimiter = new SocketRateLimiter();
 
   // ─────────────────────────────────────────────────────────────
   // Register namespace handlers
@@ -89,7 +92,8 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
     broadcastActiveRoomUpdate,
     roomRegistry,
     sanitizeRoom,
-    deepgramManager
+    deepgramManager,
+    rateLimiter
   );
 
   setupCandidateHandlers(
@@ -100,7 +104,8 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
     broadcastActiveRoomUpdate,
     roomRegistry,
     sanitizeRoom,
-    deepgramManager
+    deepgramManager,
+    rateLimiter
   );
 
   setupSupervisorHandlers(
@@ -110,7 +115,8 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
     broadcastToRoom,
     broadcastActiveRoomUpdate,
     roomRegistry,
-    sanitizeRoom
+    sanitizeRoom,
+    rateLimiter
   );
 
   // ─────────────────────────────────────────────────────────────
@@ -119,6 +125,7 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
   setInterval(() => {
     roomRegistry.cleanupIdleRooms((roomId) => {
       deepgramManager.stopSession(roomId);
+      rateLimiter.cleanupRoom(roomId);
       broadcastToRoom(roomId, 'room:terminated', {
         reason: 'Room expired due to inactivity'
       });
@@ -130,13 +137,19 @@ export function setupSockets(httpServer, socketCorsConfig = {}) {
   // ─────────────────────────────────────────────────────────────
   // Graceful shutdown — stop all Deepgram sessions
   // ─────────────────────────────────────────────────────────────
-  process.once('SIGTERM', () => deepgramManager.stopAll());
-  process.once('SIGINT',  () => deepgramManager.stopAll());
+  process.once('SIGTERM', () => {
+    deepgramManager.stopAll();
+    rateLimiter.stop();
+  });
+  process.once('SIGINT',  () => {
+    deepgramManager.stopAll();
+    rateLimiter.stop();
+  });
 
   // ─────────────────────────────────────────────────────────────
   // Logging
   // ─────────────────────────────────────────────────────────────
-  console.log(
-    'Socket.IO namespaces initialized: /interviewer, /candidate, /supervisor'
-  );
+  logger.info('Socket.IO namespaces initialized', {
+    namespaces: ['/interviewer', '/candidate', '/supervisor'],
+  });
 }

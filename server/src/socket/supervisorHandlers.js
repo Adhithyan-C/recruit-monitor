@@ -1,29 +1,42 @@
+import { enforceRateLimit } from '../utils/socketRateLimiter.js';
+import { logger } from '../utils/logger.js';
+import { isActiveRoom } from '../utils/socketSecurity.js';
+
 export function setupSupervisorHandlers(
   interviewerNS, candidateNS, supervisorNS,
   broadcastToRoom, broadcastActiveRoomUpdate,
-  roomRegistry, sanitizeRoom
+  roomRegistry, sanitizeRoom, rateLimiter
 ) {
   supervisorNS.on('connection', (socket) => {
-    console.log(`Supervisor connected: ${socket.id} (${socket.user.email})`);
+    logger.info('supervisor connected', {
+      namespace: '/supervisor',
+      socketId: socket.id,
+      userId: socket.user?.userId,
+    });
 
-    // Send active rooms immediately on connect
     const rooms = roomRegistry.getAllActiveRooms().map(sanitizeRoom);
     socket.emit('supervisor:active-rooms', { rooms });
 
-    // supervisor:join-room
-    socket.on('supervisor:join-room', ({ roomId }) => {
+    socket.on('supervisor:join-room', ({ roomId } = {}) => {
+      if (!enforceRateLimit({
+        socket,
+        limiter: rateLimiter,
+        event: 'supervisor:join-room',
+        roomId,
+        logger,
+        namespace: '/supervisor',
+      })) return;
+
       const room = roomRegistry.getRoomById(roomId);
-      if (!room) {
+      if (!isActiveRoom(room)) {
         socket.emit('error:room', { message: 'Room not found.' });
         return;
       }
-      // One supervisor per room
       if (room.supervisorSocketId && room.supervisorSocketId !== socket.id) {
         socket.emit('error:room', { message: 'Another supervisor is already monitoring this interview.' });
         return;
       }
 
-      // Leave previous room if monitoring a different one
       const prev = roomRegistry.getRoomBySocketId(socket.id);
       if (prev && prev.roomId !== roomId) {
         roomRegistry.updateRoom(prev.roomId, { supervisorSocketId: null });
@@ -32,28 +45,43 @@ export function setupSupervisorHandlers(
 
       roomRegistry.updateRoom(roomId, { supervisorSocketId: socket.id });
       socket.join(roomId);
-
-      // Send current transcript immediately
       socket.emit('transcript:broadcast', { text: room.transcriptText });
 
-      console.log(`Supervisor joined room ${room.roomCode}`);
+      logger.info('supervisor joined room', {
+        namespace: '/supervisor',
+        socketId: socket.id,
+        userId: socket.user?.userId,
+        roomId,
+      });
       broadcastActiveRoomUpdate();
     });
 
-    // supervisor:leave-room
     socket.on('supervisor:leave-room', () => {
       const room = roomRegistry.getRoomBySocketId(socket.id);
-      if (!room) return;
-      console.log(`Supervisor left room ${room.roomCode}`);
+      if (!room || room.supervisorSocketId !== socket.id) return;
+
+      logger.info('supervisor left room', {
+        namespace: '/supervisor',
+        socketId: socket.id,
+        userId: socket.user?.userId,
+        roomId: room.roomId,
+      });
       roomRegistry.updateRoom(room.roomId, { supervisorSocketId: null });
       socket.leave(room.roomId);
       broadcastActiveRoomUpdate();
     });
 
-    socket.on('disconnect', () => {
-      console.log(`Supervisor disconnected: ${socket.id}`);
+    socket.on('disconnect', (reason) => {
+      logger.info('supervisor disconnected', {
+        namespace: '/supervisor',
+        socketId: socket.id,
+        userId: socket.user?.userId,
+        reason,
+      });
+      rateLimiter.cleanupSocket(socket.id);
+
       const room = roomRegistry.getRoomBySocketId(socket.id);
-      if (room) {
+      if (room && room.supervisorSocketId === socket.id) {
         roomRegistry.updateRoom(room.roomId, { supervisorSocketId: null });
         broadcastActiveRoomUpdate();
       }

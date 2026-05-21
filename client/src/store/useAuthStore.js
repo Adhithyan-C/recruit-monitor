@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { tokenStorage } from '../utils/tokenStorage.js';
 
 function parseJwt(token) {
   try {
@@ -23,29 +24,29 @@ export const useAuthStore = create((set) => ({
   isAuthenticated: false,
 
   login: (user, token) => {
-    sessionStorage.setItem('token', token);
+    tokenStorage.set(token);
     set({ user, token, isAuthenticated: true });
   },
 
   logout: () => {
-    sessionStorage.removeItem('token');
+    tokenStorage.clear();
     set({ user: null, token: null, isAuthenticated: false });
   },
 
   rehydrate: () => {
-    const token = sessionStorage.getItem('token');
+    const token = tokenStorage.get();
     if (!token) return;
 
     const payload = parseJwt(token);
     if (!payload) {
-      sessionStorage.removeItem('token');
+      tokenStorage.clear();
       return;
     }
 
     // Check if token is expired
     const now = Math.floor(Date.now() / 1000);
     if (payload.exp && payload.exp < now) {
-      sessionStorage.removeItem('token');
+      tokenStorage.clear();
       return;
     }
 
