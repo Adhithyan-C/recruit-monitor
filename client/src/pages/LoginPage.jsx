@@ -31,6 +31,8 @@ export default function LoginPage() {
         navigate('/interviewer');
       } else if (res.data.user.role === 'supervisor') {
         navigate('/supervisor');
+      } else if (res.data.user.role === 'candidate') {
+        navigate('/join');
       }
     } catch (err) {
       console.warn('Login failed:', err);

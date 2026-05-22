@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useRoomStore } from '../store/useRoomStore.js';
 import { useTranscriptStore } from '../store/useTranscriptStore.js';
+import { useAuthStore } from '../store/useAuthStore.js';
 import { getSocket } from '../hooks/useSocket.js';
 
 export default function CandidateJoinPage() {
@@ -10,8 +11,10 @@ export default function CandidateJoinPage() {
   const setUserRole = useRoomStore((s) => s.setUserRole);
   const setCandidateName = useRoomStore((s) => s.setCandidateName);
   const setText = useTranscriptStore((s) => s.setText);
+  const authUser = useAuthStore((s) => s.user);
+  const isAuthCandidate = authUser?.role === 'candidate';
 
-  const [name, setName] = useState('');
+  const [name, setName] = useState(isAuthCandidate && authUser?.name ? authUser.name : '');
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);

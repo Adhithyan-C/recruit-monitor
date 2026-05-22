@@ -26,6 +26,16 @@ const ROLES = [
       </svg>
     ),
   },
+  {
+    value: 'candidate',
+    label: 'Candidate',
+    desc: 'Participate in interviews',
+    icon: (
+      <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+      </svg>
+    ),
+  },
 ];
 
 export default function RegisterPage() {
@@ -97,6 +107,8 @@ export default function RegisterPage() {
         navigate('/interviewer');
       } else if (res.data.user.role === 'supervisor') {
         navigate('/supervisor');
+      } else if (res.data.user.role === 'candidate') {
+        navigate('/join');
       }
     } catch (err) {
       console.warn('Registration failed:', err);
@@ -141,7 +153,7 @@ export default function RegisterPage() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-surface-50 mb-1">Create Account</h1>
-          <p className="text-surface-400 text-sm">Join RecruitMonitor as an interviewer or supervisor</p>
+          <p className="text-surface-400 text-sm">Join RecruitMonitor as an interviewer, supervisor, or candidate</p>
         </div>
 
         {/* Register Card */}
@@ -244,7 +256,7 @@ export default function RegisterPage() {
             {/* Role Selector */}
             <div>
               <label className="block text-sm font-medium text-surface-300 mb-2">Select Your Role</label>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-3">
                 {ROLES.map((r) => (
                   <button
                     key={r.value}

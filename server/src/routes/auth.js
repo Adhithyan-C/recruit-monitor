@@ -23,7 +23,7 @@ const registerLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const VALID_ROLES = new Set(['interviewer', 'supervisor']);
+const VALID_ROLES = new Set(['interviewer', 'supervisor', 'candidate']);
 
 function normalizeRegistrationInput(body) {
   return {
@@ -162,7 +162,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     const role = supabaseUser.user_metadata?.role;
     const name = supabaseUser.user_metadata?.name;
 
-    if (!role || !['interviewer', 'supervisor'].includes(role)) {
+    if (!role || !VALID_ROLES.has(role)) {
       logger.warn('login rejected - no valid role');
       return res.status(403).json({ error: 'Access denied. Your account does not have platform access.' });
     }
