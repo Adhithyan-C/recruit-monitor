@@ -1,0 +1,101 @@
+import type { Server } from 'socket.io';
+import type { MeetingStatus } from '../domain/meetingMachine.js';
+import type { SegmentRow, NoteRow } from '../domain/TranscriptService.js';
+import type { QueuedCandidate } from '../domain/PresenceService.js';
+import type { OpenMeetingDetails } from '../domain/MeetingService.js';
+import { logger } from '../lib/logger.js';
+
+const INTERVIEWER_NSP = '/interviewer';
+const CANDIDATE_NSP   = '/candidate';
+const SUPERVISOR_NSP  = '/supervisor';
+
+function meetingRoom(meetingId: string): string {
+  return `meeting:${meetingId}`;
+}
+
+/**
+ * Centralises all server→client emits so socket transport details
+ * never leak into domain services.
+ *
+ * Passed to PresenceService.onBroadcast, MeetingService callbacks,
+ * and namespace event handlers.
+ */
+export class BroadcastHelper {
+  constructor(private readonly io: Server) {}
+
+  /** Notifies all connected interviewers and supervisors that candidate queue state has changed. */
+  presenceDelta(candidates: QueuedCandidate[]): void {
+    const payload = { candidates };
+    logger.info({ count: candidates.length }, 'broadcast: presenceDelta to INTERVIEWER, SUPERVISOR');
+    this.io.of(INTERVIEWER_NSP).emit('candidate_queue_update', payload);
+    this.io.of(SUPERVISOR_NSP).emit('candidate_queue_update', payload);
+  }
+
+  /** Pushes a new transcript segment to everyone in the meeting room. */
+  transcriptSegment(meetingId: string, segment: SegmentRow): void {
+    const room = meetingRoom(meetingId);
+    logger.info({ meetingId, segmentId: segment.id }, 'broadcast: transcriptSegment to INTERVIEWER, SUPERVISOR, CANDIDATE');
+    this.io.of(INTERVIEWER_NSP).to(room).emit('transcript_segment', segment);
+    this.io.of(CANDIDATE_NSP).to(room).emit('transcript_segment', segment);
+    this.io.of(SUPERVISOR_NSP).to(room).emit('transcript_segment', segment);
+  }
+
+  /** Broadcasts a new note to staff in the meeting room. */
+  noteAdded(meetingId: string, note: NoteRow): void {
+    const room = meetingRoom(meetingId);
+    logger.info({ meetingId, noteId: note.id }, 'broadcast: noteAdded to INTERVIEWER, SUPERVISOR, CANDIDATE');
+    this.io.of(INTERVIEWER_NSP).to(room).emit('note_added', note);
+    this.io.of(CANDIDATE_NSP).to(room).emit('note_added', note);
+    this.io.of(SUPERVISOR_NSP).to(room).emit('note_added', note);
+  }
+
+  /** Broadcasts a note body update to staff in the meeting room. */
+  noteUpdated(meetingId: string, payload: { noteId: string; body: string; updatedAt: Date }): void {
+    const room = meetingRoom(meetingId);
+    logger.info({ meetingId, noteId: payload.noteId }, 'broadcast: noteUpdated to INTERVIEWER, SUPERVISOR, CANDIDATE');
+    this.io.of(INTERVIEWER_NSP).to(room).emit('note_updated', payload);
+    this.io.of(CANDIDATE_NSP).to(room).emit('note_updated', payload);
+    this.io.of(SUPERVISOR_NSP).to(room).emit('note_updated', payload);
+  }
+
+  /** Broadcasts a note deletion to staff in the meeting room. */
+  noteDeleted(meetingId: string, payload: { noteId: string }): void {
+    const room = meetingRoom(meetingId);
+    logger.info({ meetingId, noteId: payload.noteId }, 'broadcast: noteDeleted to INTERVIEWER, SUPERVISOR, CANDIDATE');
+    this.io.of(INTERVIEWER_NSP).to(room).emit('note_deleted', payload);
+    this.io.of(CANDIDATE_NSP).to(room).emit('note_deleted', payload);
+    this.io.of(SUPERVISOR_NSP).to(room).emit('note_deleted', payload);
+  }
+
+  /** Notifies the meeting room that the Deepgram pipeline has failed unrecoverably. */
+  transcriptError(meetingId: string): void {
+    const room    = meetingRoom(meetingId);
+    const payload = { meetingId };
+    this.io.of(INTERVIEWER_NSP).to(room).emit('transcript_error', payload);
+    this.io.of(CANDIDATE_NSP).to(room).emit('transcript_error', payload);
+    this.io.of(SUPERVISOR_NSP).to(room).emit('transcript_error', payload);
+  }
+
+  /** Broadcasts a meeting status change to all participants in the meeting room,
+   *  and to supervisors subscribed to the active meetings monitor.
+   *  `extra` carries optional name/UID fields used by the candidate to resolve
+   *  the interviewer's video tile label when status becomes 'active'. */
+  meetingStatus(
+    meetingId: string,
+    status: MeetingStatus,
+    extra?: { interviewerName?: string | null; participantUids?: { interviewerUid: number; candidateUid: number } },
+  ): void {
+    const payload = extra ? { meetingId, status, ...extra } : { meetingId, status };
+    const room    = meetingRoom(meetingId);
+    this.io.of(INTERVIEWER_NSP).to(room).emit('meeting_status', payload);
+    this.io.of(CANDIDATE_NSP).to(room).emit('meeting_status', payload);
+    // Emit to meeting room AND meetings_monitor — Socket.IO deduplicates per-socket.
+    this.io.of(SUPERVISOR_NSP).to(room).to('meetings_monitor').emit('meeting_status', payload);
+  }
+
+  /** Pushes the current list of open solo rooms to interviewers subscribed to the monitor. */
+  openRoomsUpdate(meetings: OpenMeetingDetails[]): void {
+    logger.info({ count: meetings.length, room: 'open_rooms_monitor' }, 'openRoomsUpdate: broadcasting');
+    this.io.of(INTERVIEWER_NSP).to('open_rooms_monitor').emit('open_rooms_update', { meetings });
+  }
+}
