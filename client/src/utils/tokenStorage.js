@@ -1,19 +1,13 @@
-let memoryToken = null;
-
 export const tokenStorage = {
   get() {
-    if (memoryToken) return memoryToken;
-    memoryToken = sessionStorage.getItem('token');
-    return memoryToken;
+    return localStorage.getItem('auth_token');
   },
 
   set(token) {
-    memoryToken = token;
-    sessionStorage.setItem('token', token);
+    localStorage.setItem('auth_token', token);
   },
 
   clear() {
-    memoryToken = null;
-    sessionStorage.removeItem('token');
+    localStorage.removeItem('auth_token');
   },
 };

@@ -16,10 +16,15 @@ import {
   updateNoteSchema,
   deleteNoteSchema,
 } from '../schemas/interviewer.js';
+import { shareVideoSchema, videoSyncSchema } from '../schemas/video.js';
 import { ForbiddenError, InvalidTransitionError, NotFoundError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { InterviewerSocket } from '../types.js';
 import { onSafe } from '../safeHandler.js';
+import { pool } from '../../db/pool.js';
+import { supabaseAdmin } from '../../lib/supabase.js';
+
+const VIDEO_BUCKET = 'interview-videos';
 
 export interface InterviewerDeps {
   meetingService: MeetingService;
@@ -64,53 +69,10 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
       })
       .catch((err) => logger.error({ err, userId }, 'session create failed'));
 
-    // Reconnect path: attach to an interrupted meeting if one exists.
-    const currentMeeting = await meetingService.resumeOrAttachCurrentMeeting(userId, 'interviewer');
-    if (currentMeeting) {
-      try {
-        let status = currentMeeting.status;
-        if (currentMeeting.shouldMarkReconnected) {
-          await meetingService.onParticipantReconnect(currentMeeting.id, userId);
-          status = 'active';
-          broadcast.meetingStatus(currentMeeting.id, status);
-        }
-
-        socket.data.meetingId = currentMeeting.id;
-        await socket.join(`meeting:${currentMeeting.id}`);
-
-        const uid = AgoraTokenService.deriveUid(currentMeeting.id, userId);
-        const agoraToken = agoraTokenService.generateToken({
-          channelName: currentMeeting.agoraChannel,
-          uid,
-          role: 'publisher',
-        });
-
-        socket.emit('meeting_attached', {
-          meetingId:     currentMeeting.id,
-          status,
-          agoraChannel:  currentMeeting.agoraChannel,
-          agoraToken,
-          uid,
-          candidateId:   currentMeeting.candidateId,
-          interviewerId: currentMeeting.interviewerId,
-          participantUids: {
-            interviewerUid: currentMeeting.interviewerId
-              ? AgoraTokenService.deriveUid(currentMeeting.id, currentMeeting.interviewerId)
-              : null,
-            candidateUid: AgoraTokenService.deriveUid(currentMeeting.id, currentMeeting.candidateId),
-          },
-        });
-
-        logger.info(
-          { socketId: socket.id, userId, meetingId: currentMeeting.id, status },
-          'interviewer reattached to current meeting',
-        );
-      } catch (err) {
-        logger.warn({ err, userId, meetingId: currentMeeting.id }, 'interviewer meeting reattach failed');
-      }
-    }
-
-    logger.info({ socketId: socket.id, userId, role }, 'interviewer connected');
+    // Register ALL listeners before any await so events emitted during async
+    // initialization (e.g. resumeOrAttachCurrentMeeting) are not silently
+    // dropped by Socket.IO. Handlers that need socket.data.meetingId read it
+    // at call time, not at registration time, so this reordering is safe.
 
     // ── Open rooms subscription ───────────────────────────────────────────
 
@@ -120,8 +82,9 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
       rateLimit: { limit: 20, windowMs: 60_000 },
     }, async (_payload, { ack }) => {
       await socket.join('open_rooms_monitor');
-      const meetings = await meetingService.getOpenMeetingsWithNames();
-      logger.info({ userId, socketId: socket.id, roomCount: meetings.length }, 'subscribe_open_rooms: returning rooms');
+      const lang = socket.data.user?.language ?? 'english';
+      const meetings = await meetingService.getOpenMeetingsWithNames(lang);
+      logger.info({ userId, socketId: socket.id, roomCount: meetings.length, lang }, 'subscribe_open_rooms: returning rooms');
       ack({ ok: true, data: { meetings } });
     });
 
@@ -132,6 +95,30 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
       schema: joinOpenMeetingSchema,
       rateLimit: { limit: 10, windowMs: 60_000 },
     }, async ({ meetingId }, { ack }) => {
+      // Language pre-flight — belt-and-suspenders guard against race conditions.
+      // The open rooms list is already language-filtered; this catches stale joins.
+      try {
+        const { rows: langRows } = await pool.query<{ language: string }>(
+          `SELECT u.language
+             FROM meetings m
+             JOIN users u ON u.id = m.candidate_id
+            WHERE m.id = $1 AND m.status = 'open'`,
+          [meetingId],
+        );
+        if (langRows.length > 0) {
+          const candidateLang   = langRows[0]!.language;
+          const interviewerLang = socket.data.user?.language ?? 'english';
+          if (candidateLang !== interviewerLang) {
+            ack({ ok: true });
+            return;
+          }
+        }
+      } catch (err) {
+        logger.error({ err, meetingId }, 'join_open_meeting: language pre-flight failed');
+        ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+        return;
+      }
+
       try {
         const { agoraChannel, candidateId, interviewerName } = await meetingService.onInterviewerJoin(meetingId, userId);
 
@@ -154,8 +141,7 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
         });
 
         // Remove this room from the open rooms list on all interviewer dashboards.
-        meetingService.getOpenMeetingsWithNames()
-          .then((rooms) => broadcast.openRoomsUpdate(rooms))
+        broadcast.openRoomsUpdate()
           .catch((err) => logger.error({ err }, 'openRoomsUpdate after join_open_meeting failed'));
 
         // Update candidate socket's cached status so audio_chunk allows through immediately.
@@ -363,5 +349,124 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
         }
       }
     });
+
+    // ── Video resume ──────────────────────────────────────────────────────
+
+    onSafe(socket, {
+      event: 'share_video',
+      schema: shareVideoSchema,
+      rateLimit: { limit: 10, windowMs: 60_000 },
+    }, async ({ meetingId, videoId }) => {
+      if (!socket.rooms.has(`meeting:${meetingId}`)) return;
+
+      const result = await pool.query<{ storage_path: string }>(
+        'SELECT storage_path FROM meeting_videos WHERE id = $1 AND meeting_id = $2',
+        [videoId, meetingId],
+      );
+      if (result.rows.length === 0) {
+        logger.warn({ userId, meetingId, videoId }, 'share_video: video not found');
+        return;
+      }
+
+      const { data, error } = await supabaseAdmin.storage
+        .from(VIDEO_BUCKET)
+        .createSignedUrl(result.rows[0]!.storage_path, 3600);
+
+      if (error || !data) {
+        logger.error({ error, meetingId, videoId }, 'share_video: signed URL generation failed');
+        return;
+      }
+
+      const payload = { videoId, signedUrl: data.signedUrl, sharedBy: userId };
+      io.of('/interviewer').in(`meeting:${meetingId}`).emit('video_available', payload);
+      io.of('/candidate').in(`meeting:${meetingId}`).emit('video_available', payload);
+      io.of('/supervisor').in(`meeting:${meetingId}`).emit('video_available', payload);
+      logger.info({ userId, meetingId, videoId }, 'share_video: broadcast sent');
+    });
+
+    onSafe(socket, {
+      event: 'video_play',
+      schema: videoSyncSchema,
+      rateLimit: { limit: 60, windowMs: 60_000 },
+    }, ({ meetingId, videoId, currentTime }) => {
+      if (!socket.rooms.has(`meeting:${meetingId}`)) return;
+      const syncPayload = { videoId, currentTime };
+      nsp.in(`meeting:${meetingId}`).except(socket.id).emit('video_play_sync', syncPayload);
+      io.of('/candidate').in(`meeting:${meetingId}`).emit('video_play_sync', syncPayload);
+      io.of('/supervisor').in(`meeting:${meetingId}`).emit('video_play_sync', syncPayload);
+    });
+
+    onSafe(socket, {
+      event: 'video_pause',
+      schema: videoSyncSchema,
+      rateLimit: { limit: 60, windowMs: 60_000 },
+    }, ({ meetingId, videoId, currentTime }) => {
+      if (!socket.rooms.has(`meeting:${meetingId}`)) return;
+      const syncPayload = { videoId, currentTime };
+      nsp.in(`meeting:${meetingId}`).except(socket.id).emit('video_pause_sync', syncPayload);
+      io.of('/candidate').in(`meeting:${meetingId}`).emit('video_pause_sync', syncPayload);
+      io.of('/supervisor').in(`meeting:${meetingId}`).emit('video_pause_sync', syncPayload);
+    });
+
+    onSafe(socket, {
+      event: 'video_seek',
+      schema: videoSyncSchema,
+      rateLimit: { limit: 60, windowMs: 60_000 },
+    }, ({ meetingId, videoId, currentTime }) => {
+      if (!socket.rooms.has(`meeting:${meetingId}`)) return;
+      const syncPayload = { videoId, currentTime };
+      nsp.in(`meeting:${meetingId}`).except(socket.id).emit('video_seek_sync', syncPayload);
+      io.of('/candidate').in(`meeting:${meetingId}`).emit('video_seek_sync', syncPayload);
+      io.of('/supervisor').in(`meeting:${meetingId}`).emit('video_seek_sync', syncPayload);
+    });
+
+    // Reconnect path: attach to an interrupted meeting if one exists.
+    // All listeners are registered above so no events are dropped during this await.
+    const currentMeeting = await meetingService.resumeOrAttachCurrentMeeting(userId, 'interviewer');
+    if (currentMeeting) {
+      try {
+        let status = currentMeeting.status;
+        if (currentMeeting.shouldMarkReconnected) {
+          await meetingService.onParticipantReconnect(currentMeeting.id, userId);
+          status = 'active';
+          broadcast.meetingStatus(currentMeeting.id, status);
+        }
+
+        socket.data.meetingId = currentMeeting.id;
+        await socket.join(`meeting:${currentMeeting.id}`);
+
+        const uid = AgoraTokenService.deriveUid(currentMeeting.id, userId);
+        const agoraToken = agoraTokenService.generateToken({
+          channelName: currentMeeting.agoraChannel,
+          uid,
+          role: 'publisher',
+        });
+
+        socket.emit('meeting_attached', {
+          meetingId:     currentMeeting.id,
+          status,
+          agoraChannel:  currentMeeting.agoraChannel,
+          agoraToken,
+          uid,
+          candidateId:   currentMeeting.candidateId,
+          interviewerId: currentMeeting.interviewerId,
+          participantUids: {
+            interviewerUid: currentMeeting.interviewerId
+              ? AgoraTokenService.deriveUid(currentMeeting.id, currentMeeting.interviewerId)
+              : null,
+            candidateUid: AgoraTokenService.deriveUid(currentMeeting.id, currentMeeting.candidateId),
+          },
+        });
+
+        logger.info(
+          { socketId: socket.id, userId, meetingId: currentMeeting.id, status },
+          'interviewer reattached to current meeting',
+        );
+      } catch (err) {
+        logger.warn({ err, userId, meetingId: currentMeeting.id }, 'interviewer meeting reattach failed');
+      }
+    }
+
+    logger.info({ socketId: socket.id, userId, role }, 'interviewer connected');
   });
 }

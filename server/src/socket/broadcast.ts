@@ -2,7 +2,8 @@ import type { Server } from 'socket.io';
 import type { MeetingStatus } from '../domain/meetingMachine.js';
 import type { SegmentRow, NoteRow } from '../domain/TranscriptService.js';
 import type { QueuedCandidate } from '../domain/PresenceService.js';
-import type { OpenMeetingDetails } from '../domain/MeetingService.js';
+import type { MeetingService } from '../domain/MeetingService.js';
+import type { InternalJwtPayload } from '../auth/jwt.js';
 import { logger } from '../lib/logger.js';
 
 const INTERVIEWER_NSP = '/interviewer';
@@ -21,7 +22,10 @@ function meetingRoom(meetingId: string): string {
  * and namespace event handlers.
  */
 export class BroadcastHelper {
-  constructor(private readonly io: Server) {}
+  constructor(
+    private readonly io: Server,
+    private readonly meetingService: MeetingService,
+  ) {}
 
   /** Notifies all connected interviewers and supervisors that candidate queue state has changed. */
   presenceDelta(candidates: QueuedCandidate[]): void {
@@ -93,9 +97,17 @@ export class BroadcastHelper {
     this.io.of(SUPERVISOR_NSP).to(room).to('meetings_monitor').emit('meeting_status', payload);
   }
 
-  /** Pushes the current list of open solo rooms to interviewers subscribed to the monitor. */
-  openRoomsUpdate(meetings: OpenMeetingDetails[]): void {
-    logger.info({ count: meetings.length, room: 'open_rooms_monitor' }, 'openRoomsUpdate: broadcasting');
-    this.io.of(INTERVIEWER_NSP).to('open_rooms_monitor').emit('open_rooms_update', { meetings });
+  /** Pushes each subscribed interviewer their own language-filtered list of open rooms. */
+  async openRoomsUpdate(): Promise<void> {
+    const sockets = await this.io.of(INTERVIEWER_NSP).in('open_rooms_monitor').fetchSockets();
+    for (const s of sockets) {
+      try {
+        const lang = (s.data as { user?: InternalJwtPayload })?.user?.language ?? 'english';
+        const rooms = await this.meetingService.getOpenMeetingsWithNames(lang);
+        s.emit('open_rooms_update', { meetings: rooms });
+      } catch (err) {
+        logger.error({ err, socketId: s.id }, 'openRoomsUpdate: per-socket query failed');
+      }
+    }
   }
 }

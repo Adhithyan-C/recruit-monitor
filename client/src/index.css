@@ -1,4 +1,12 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+/* Geist — loaded via @fontsource/geist (npm package, no external request) */
+@import '@fontsource/geist/300.css';
+@import '@fontsource/geist/400.css';
+@import '@fontsource/geist/500.css';
+@import '@fontsource/geist/600.css';
+@import '@fontsource/geist/700.css';
+@import '@fontsource/geist/800.css';
+/* JetBrains Mono — monospace for IDs, timers, room codes */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -26,6 +34,13 @@ body {
   flex-direction: column;
 }
 
+/* ── Monospace — tabular numbers for timers / IDs ─────────────── */
+/* Apply tabular-nums to any element using font-mono so elapsed    */
+/* timers and segment counts don't shift layout as digits change.  */
+.font-mono {
+  font-feature-settings: "tnum" 1, "zero" 1;
+}
+
 /* ── Scrollbar Styling ────────────────────────────────────────── */
 ::-webkit-scrollbar {
   width: 6px;
@@ -37,57 +52,72 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-surface-600 rounded-full;
+  @apply bg-surface-700 rounded-full;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-surface-500;
+  @apply bg-surface-600;
 }
 
-/* ── Glassmorphism Utilities ──────────────────────────────────── */
+/* ── Card & Input Utilities ───────────────────────────────────── */
 @layer components {
+  /* Solid card — no blur, no gradient. Backdrop-blur removed:      */
+  /* it blurred nothing over near-black and triggered GPU compositing. */
   .glass-card {
-    @apply bg-surface-800/60 backdrop-blur-lg border border-surface-700/50 rounded-2xl;
+    @apply bg-surface-800/60 border border-surface-700/50 rounded-lg;
   }
 
   .glass-card-hover {
-    @apply glass-card transition-all duration-300 hover:bg-surface-800/80 hover:border-surface-600/50 hover:shadow-xl hover:shadow-primary-500/5;
+    @apply glass-card transition-colors duration-200
+           hover:bg-surface-800/80 hover:border-surface-600/50;
   }
 
+  /* Input — rounded-md (not rounded-xl); simple border focus,      */
+  /* no blurred ring that competes visually with the border itself. */
   .glass-input {
-    @apply w-full bg-surface-900/80 border border-surface-700/60 rounded-xl px-4 py-3 text-surface-100 
-           placeholder:text-surface-500 focus:outline-none focus:ring-2 focus:ring-primary-500/40 
-           focus:border-primary-500/60 transition-all duration-200;
+    @apply w-full bg-surface-900/80 border border-surface-700/60 rounded-md px-4 py-3
+           text-surface-100 placeholder:text-surface-500
+           transition-colors duration-150;
   }
+  .glass-input:focus {
+    @apply outline-none border-primary-500;
+  }
+
+  /* ── Buttons ──────────────────────────────────────────────────── */
+  /* All gradients, glow shadows, and active:scale removed.         */
+  /* Flat solid colour only — conveys authority more clearly.       */
 
   .btn-primary {
-    @apply px-6 py-3 bg-gradient-to-r from-primary-600 to-primary-500 text-white font-semibold 
-           rounded-xl shadow-lg shadow-primary-500/25 hover:shadow-primary-500/40 
-           hover:from-primary-500 hover:to-primary-400 active:scale-[0.98] 
-           transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed 
-           disabled:hover:shadow-primary-500/25 disabled:active:scale-100;
+    @apply px-6 py-3 bg-primary-600 text-white font-medium rounded-md
+           hover:bg-primary-500
+           transition-colors duration-150
+           disabled:opacity-50 disabled:cursor-not-allowed;
   }
 
   .btn-secondary {
-    @apply px-6 py-3 bg-surface-800 border border-surface-600/50 text-surface-200 font-medium 
-           rounded-xl hover:bg-surface-700 hover:border-surface-500/50 active:scale-[0.98] 
-           transition-all duration-200;
+    @apply px-6 py-3 bg-surface-800 border border-surface-600/50
+           text-surface-200 font-medium rounded-md
+           hover:bg-surface-700 hover:border-surface-500/50
+           transition-colors duration-150;
   }
 
+  /* Danger uses rose-500 solid — no gradient, no glow. */
   .btn-danger {
-    @apply px-6 py-3 bg-gradient-to-r from-danger-600 to-danger-500 text-white font-semibold 
-           rounded-xl shadow-lg shadow-danger-500/25 hover:shadow-danger-500/40 
-           active:scale-[0.98] transition-all duration-200;
+    @apply px-6 py-3 bg-danger-500 text-white font-semibold rounded-md
+           hover:bg-danger-600
+           transition-colors duration-150;
   }
 
   .btn-icon {
-    @apply p-3 rounded-xl bg-surface-800/80 border border-surface-700/50 text-surface-300 
-           hover:bg-surface-700 hover:text-surface-100 active:scale-[0.95] 
-           transition-all duration-200;
+    @apply p-3 rounded-md bg-surface-800/80 border border-surface-700/50
+           text-surface-300 hover:bg-surface-700 hover:text-surface-100
+           transition-colors duration-150;
   }
 
+  /* ── Status badges ────────────────────────────────────────────── */
   .status-badge {
-    @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider;
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5
+           rounded text-xs font-medium tracking-wide;
   }
 
   .status-waiting {
@@ -102,21 +132,23 @@ body {
     @apply status-badge bg-surface-500/15 text-surface-400 border border-surface-500/20;
   }
 
+  /* ── Toasts ───────────────────────────────────────────────────── */
+  /* Solid background — backdrop-blur removed (no content behind). */
   .toast {
-    @apply fixed top-4 right-4 z-50 px-6 py-4 rounded-xl shadow-2xl animate-slide-in-right 
-           backdrop-blur-lg border max-w-md;
+    @apply fixed top-4 right-4 z-50 px-5 py-4 rounded-lg
+           shadow-lg border max-w-md animate-slide-in-right;
   }
 
   .toast-error {
-    @apply toast bg-danger-600/90 border-danger-500/50 text-white;
+    @apply toast bg-danger-600 border-danger-500/40 text-white;
   }
 
   .toast-success {
-    @apply toast bg-success-600/90 border-success-500/50 text-white;
+    @apply toast bg-success-600 border-success-500/40 text-white;
   }
 
   .toast-warning {
-    @apply toast bg-warning-600/90 border-warning-500/50 text-white;
+    @apply toast bg-warning-600 border-warning-500/40 text-white;
   }
 }
 
@@ -139,12 +171,12 @@ body {
 
 @keyframes dotBounce {
   0%, 80%, 100% { transform: scale(0); opacity: 0.5; }
-  40% { transform: scale(1); opacity: 1; }
+  40%           { transform: scale(1); opacity: 1; }
 }
 
 /* ── Video Grid ───────────────────────────────────────────────── */
 .video-tile {
-  @apply relative rounded-2xl overflow-hidden bg-surface-900 border border-surface-700/30;
+  @apply relative rounded-lg overflow-hidden bg-surface-900 border border-surface-700/30;
 }
 
 .video-tile video {
@@ -153,13 +185,16 @@ body {
   object-fit: cover;
 }
 
+/* backdrop-blur-sm kept here — it sits on top of live video     */
+/* so the blur is real and aids label readability.               */
 .video-tile-label {
-  @apply absolute bottom-3 left-3 px-3 py-1.5 rounded-lg bg-surface-950/70 backdrop-blur-sm 
+  @apply absolute bottom-3 left-3 px-2.5 py-1 rounded-md
+         bg-surface-950/70 backdrop-blur-sm
          text-sm font-medium text-surface-200 flex items-center gap-2;
 }
 
 /* ── Room Code Display ────────────────────────────────────────── */
 .room-code {
-  @apply font-mono text-4xl font-bold tracking-[0.3em] text-primary-400 
-         bg-surface-900/80 px-8 py-4 rounded-2xl border border-primary-500/20;
+  @apply font-mono text-4xl font-bold tracking-[0.3em] text-primary-400
+         bg-surface-900/80 px-8 py-4 rounded-lg border border-primary-500/20;
 }

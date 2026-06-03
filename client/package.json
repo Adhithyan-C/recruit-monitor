@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource/geist": "^5.2.9",
+    "@supabase/supabase-js": "^2.106.1",
     "agora-rtc-sdk-ng": "^4.24.3",
     "autoprefixer": "^10.5.0",
     "axios": "^1.16.1",

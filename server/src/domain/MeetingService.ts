@@ -182,9 +182,10 @@ export class MeetingService {
   }
 
   /**
-   * Returns open meetings with candidate names. Used by the interviewer dashboard.
+   * Returns open meetings with candidate names, filtered to a single language.
+   * Used by the interviewer dashboard and broadcast.
    */
-  async getOpenMeetingsWithNames(): Promise<OpenMeetingDetails[]> {
+  async getOpenMeetingsWithNames(language: string): Promise<OpenMeetingDetails[]> {
     const { rows } = await this.deps.pool.query<{
       id: string;
       candidate_id: string;
@@ -196,7 +197,9 @@ export class MeetingService {
          FROM meetings m
          JOIN users u ON u.id = m.candidate_id
         WHERE m.status = 'open'
+          AND u.language = $1
         ORDER BY m.created_at`,
+      [language],
     );
     return rows.map((r) => ({
       id:            r.id,
@@ -295,8 +298,8 @@ export class MeetingService {
     }));
   }
 
-  /** Returns active/interrupted meetings with participant names. Used by supervisor dashboard. */
-  async getActiveMeetingsWithNames(): Promise<MeetingDetailsWithNames[]> {
+  /** Returns active/interrupted meetings with participant names, filtered to a single language. Used by supervisor dashboard. */
+  async getActiveMeetingsWithNames(language: string): Promise<MeetingDetailsWithNames[]> {
     const { rows } = await this.deps.pool.query<MeetingRowWithNames>(
       `SELECT m.id, m.interviewer_id, m.candidate_id, m.agora_channel, m.status,
               iv.name AS interviewer_name, ca.name AS candidate_name
@@ -304,7 +307,9 @@ export class MeetingService {
          LEFT JOIN users iv ON iv.id = m.interviewer_id
          JOIN users ca ON ca.id = m.candidate_id
         WHERE m.status IN ('active', 'interrupted')
+          AND ca.language = $1
         ORDER BY m.started_at DESC NULLS LAST`,
+      [language],
     );
     return rows.map((row) => ({
       id:              row.id,

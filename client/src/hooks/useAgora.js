@@ -1,44 +1,73 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, startTransition } from 'react';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import { AGORA_APP_ID } from '../config.js';
 import { mediaLog } from '../utils/mediaLogger.js';
 
 AgoraRTC.setLogLevel(3);
 
-export default function useAgora({ role, channelName, username }) {
-  const clientRef = useRef(null);
-  const localVideoRef = useRef(null);
+export default function useAgora({ role, channelName }) {
+  const clientRef          = useRef(null);
+  const localVideoRef      = useRef(null);
   const localAudioTrackRef = useRef(null);
   const localVideoTrackRef = useRef(null);
-  const remoteUsersRef = useRef([]);
-  const joiningRef = useRef(false);
-  const mountedRef = useRef(true);
+  const remoteUsersRef     = useRef([]);
+  const joiningRef         = useRef(false);
+  const mountedRef         = useRef(false);
+  const localUidRef        = useRef(null);   // integer UID assigned by server
   const recreateAudioTrackRef = useRef(null);
 
   const [localAudioTrack, setLocalAudioTrack] = useState(null);
   const [localVideoTrack, setLocalVideoTrack] = useState(null);
-  const [remoteUsers, setRemoteUsers] = useState([]);
-  const [isJoined, setIsJoined] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
-  const [isCameraOff, setIsCameraOff] = useState(false);
+  const [remoteUsers,     setRemoteUsers]     = useState([]);
+  const [isJoined,        setIsJoined]        = useState(false);
+  const [isConnecting,    setIsConnecting]    = useState(false);
+  const [isMuted,         setIsMuted]         = useState(false);
+  const [isCameraOff,     setIsCameraOff]     = useState(false);
 
-  const publishTrack = useCallback(async (track) => {
-    const client = clientRef.current;
-    if (!client || !track) return;
+  // ── AudioContext resume ───────────────────────────────────────────────
+  // Browsers auto-suspend AudioContext on tab switch or window blur.
+  // We attempt resume via the SDK's shared context before re-enabling tracks.
+
+  const resumeAudioContext = useCallback(async () => {
     try {
-      await client.publish(track);
-      mediaLog('info', 'agora track published', { role, channelName, kind: track.trackMediaType });
-    } catch (err) {
-      if (!String(err?.message || '').includes('already published')) {
-        mediaLog('warn', 'agora publish failed', { role, channelName, reason: err.message });
+      const ctx = AgoraRTC.getAudioContext?.();
+      if (ctx && ctx.state === 'suspended') {
+        await ctx.resume();
+        mediaLog('info', 'agora AudioContext resumed', { role });
       }
+    } catch (err) {
+      mediaLog('warn', 'agora AudioContext resume failed', { role, reason: err.message });
     }
-  }, [channelName, role]);
+  }, [role]);
+
+  // Register the three resume call sites once on mount; clean up on unmount.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') resumeAudioContext();
+    };
+    const onFocus = () => resumeAudioContext();
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Remote user helpers ───────────────────────────────────────────────
 
   const updateRemoteUsers = useCallback(() => {
-    const visible = remoteUsersRef.current.filter((u) => !String(u.uid).startsWith('_sv_'));
-    setRemoteUsers([...visible]);
+    // Filter out our own UID in case it surfaces (should not happen, but defensive).
+    // No _sv_ prefix logic — supervisors hold subscriber-only tokens and never
+    // publish tracks, so they never trigger user-published on other clients.
+    const visible = remoteUsersRef.current.filter(
+      (u) => u.uid !== localUidRef.current,
+    );
+    // startTransition defers this non-urgent update so it can't land during
+    // React 19's concurrent render cycle and trigger "update during render".
+    startTransition(() => setRemoteUsers([...visible]));
   }, []);
 
   const bindClientEvents = useCallback((client) => {
@@ -56,7 +85,7 @@ export default function useAgora({ role, channelName, username }) {
         }
         if (mediaType === 'audio' && user.audioTrack) user.audioTrack.play();
         updateRemoteUsers();
-        mediaLog('info', 'agora remote subscribed', { role, channelName, uid: String(user.uid), mediaType });
+        mediaLog('info', 'agora remote subscribed', { role, channelName, uid: user.uid, mediaType });
       } catch (err) {
         mediaLog('warn', 'agora remote subscribe failed', { role, channelName, mediaType, reason: err.message });
       }
@@ -69,22 +98,24 @@ export default function useAgora({ role, channelName, username }) {
         if (mediaType === 'video') existing.videoTrack = null;
       }
       updateRemoteUsers();
-      mediaLog('info', 'agora remote unpublished', { role, channelName, uid: String(user.uid), mediaType });
+      mediaLog('info', 'agora remote unpublished', { role, channelName, uid: user.uid, mediaType });
     });
 
     client.on('user-left', (user) => {
       remoteUsersRef.current = remoteUsersRef.current.filter((u) => u.uid !== user.uid);
       updateRemoteUsers();
-      mediaLog('info', 'agora remote left', { role, channelName, uid: String(user.uid) });
+      mediaLog('info', 'agora remote left', { role, channelName, uid: user.uid });
     });
 
     client.on('connection-state-change', (curState, prevState, reason) => {
       mediaLog('info', 'agora connection state changed', { role, channelName, curState, prevState, reason });
       if (curState === 'DISCONNECTED' && prevState === 'CONNECTED') {
-        mediaLog('warn', 'agora unexpected disconnect from live channel', { role, channelName, reason });
+        mediaLog('warn', 'agora unexpected disconnect', { role, channelName, reason });
       }
     });
   }, [channelName, role, updateRemoteUsers]);
+
+  // ── Audio track recreation ────────────────────────────────────────────
 
   const recreateAudioTrack = useCallback(async () => {
     if (role === 'supervisor' || !clientRef.current) return;
@@ -92,31 +123,32 @@ export default function useAgora({ role, channelName, username }) {
       const nextTrack = await AgoraRTC.createMicrophoneAudioTrack();
       if (!mountedRef.current || !clientRef.current) {
         nextTrack.close();
-        mediaLog('warn', 'agora audio track recreate aborted (unmounted or client gone)', { role, channelName });
+        mediaLog('warn', 'agora audio recreate aborted (unmounted)', { role, channelName });
         return;
       }
-      nextTrack.on('track-ended', () => {
-        mediaLog('warn', 'agora audio track ended', { role, channelName });
-        recreateAudioTrackRef.current?.();
-      });
+      nextTrack.on('track-ended', () => recreateAudioTrackRef.current?.());
       localAudioTrackRef.current?.close();
       localAudioTrackRef.current = nextTrack;
       setLocalAudioTrack(nextTrack);
       setIsMuted(false);
-      await publishTrack(nextTrack);
+      await clientRef.current.publish(nextTrack);
       mediaLog('info', 'agora audio track recreated', { role, channelName });
     } catch (err) {
-      mediaLog('error', 'agora audio track recreate failed', { role, channelName, reason: err.message });
+      mediaLog('error', 'agora audio recreate failed', { role, channelName, reason: err.message });
     }
-  }, [channelName, publishTrack, role]);
+  }, [channelName, role]);
 
   useEffect(() => {
     recreateAudioTrackRef.current = recreateAudioTrack;
   }, [recreateAudioTrack]);
 
-  const joinChannel = useCallback(async () => {
+  // ── joinChannel ───────────────────────────────────────────────────────
+  // Called explicitly by the component after receiving the server join ack.
+  // agoraToken and uid are server-assigned — not derived client-side.
+
+  const joinChannel = useCallback(async (agoraToken, uid) => {
     if (joiningRef.current || isJoined) return;
-    if (!channelName || !username || !AGORA_APP_ID) return;
+    if (!channelName || !agoraToken || uid == null || !AGORA_APP_ID) return;
 
     joiningRef.current = true;
     setIsConnecting(true);
@@ -126,15 +158,17 @@ export default function useAgora({ role, channelName, username }) {
       clientRef.current = client;
       bindClientEvents(client);
 
-      const uid = role === 'supervisor' && !String(username).startsWith('_sv_')
-        ? `_sv_${username}`
-        : username;
-      await client.join(AGORA_APP_ID, channelName, null, uid);
-      mediaLog('info', 'agora joined', { role, channelName, uid: String(uid) });
+      await client.join(AGORA_APP_ID, channelName, agoraToken, uid);
+      if (!mountedRef.current) return;
+
+      localUidRef.current = uid;
+      mediaLog('info', 'agora joined', { role, channelName, uid });
 
       if (role !== 'supervisor') {
+        // Audio track
         try {
           const audioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+          if (!mountedRef.current) { audioTrack.close(); return; }
           audioTrack.on('track-ended', () => {
             mediaLog('warn', 'agora audio track ended', { role, channelName });
             recreateAudioTrackRef.current?.();
@@ -145,17 +179,29 @@ export default function useAgora({ role, channelName, username }) {
           mediaLog('warn', 'agora microphone unavailable', { role, channelName, reason: err.message });
         }
 
+        if (!mountedRef.current) return;
+
+        // Video track
         try {
           const videoTrack = await AgoraRTC.createCameraVideoTrack();
-          videoTrack.on('track-ended', () => mediaLog('warn', 'agora video track ended', { role, channelName }));
+          if (!mountedRef.current) { videoTrack.close(); return; }
+          videoTrack.on('track-ended', () =>
+            mediaLog('warn', 'agora video track ended', { role, channelName }),
+          );
           localVideoTrackRef.current = videoTrack;
           setLocalVideoTrack(videoTrack);
         } catch (err) {
           mediaLog('warn', 'agora camera unavailable', { role, channelName, reason: err.message });
         }
 
+        if (!mountedRef.current) return;
+
         const tracks = [localAudioTrackRef.current, localVideoTrackRef.current].filter(Boolean);
-        if (tracks.length > 0) await client.publish(tracks);
+        if (tracks.length > 0) {
+          await client.publish(tracks);
+          if (!mountedRef.current) return;
+        }
+
         mediaLog('info', 'agora local tracks ready', {
           role,
           channelName,
@@ -164,7 +210,6 @@ export default function useAgora({ role, channelName, username }) {
         });
       }
 
-      if (!mountedRef.current) return;
       setIsJoined(true);
     } catch (err) {
       mediaLog('error', 'agora join failed', { role, channelName, reason: err.message });
@@ -172,7 +217,9 @@ export default function useAgora({ role, channelName, username }) {
       joiningRef.current = false;
       if (mountedRef.current) setIsConnecting(false);
     }
-  }, [bindClientEvents, channelName, isJoined, role, username]);
+  }, [bindClientEvents, channelName, isJoined, role]);
+
+  // ── leaveChannel ──────────────────────────────────────────────────────
 
   const leaveChannel = useCallback(async () => {
     try {
@@ -188,10 +235,11 @@ export default function useAgora({ role, channelName, username }) {
     } catch (err) {
       mediaLog('warn', 'agora leave failed', { role, channelName, reason: err.message });
     }
-    clientRef.current = null;
+    clientRef.current          = null;
     localAudioTrackRef.current = null;
     localVideoTrackRef.current = null;
-    remoteUsersRef.current = [];
+    localUidRef.current        = null;
+    remoteUsersRef.current     = [];
     setLocalAudioTrack(null);
     setLocalVideoTrack(null);
     setRemoteUsers([]);
@@ -200,11 +248,17 @@ export default function useAgora({ role, channelName, username }) {
     setIsCameraOff(false);
   }, [channelName, role]);
 
+  // ── toggleMute ────────────────────────────────────────────────────────
+
   const toggleMute = useCallback(async () => {
     const track = localAudioTrackRef.current;
     if (!track) return;
     const nextMuted = !isMuted;
     try {
+      if (!nextMuted) {
+        // Resume AudioContext before re-enabling — third call site.
+        await resumeAudioContext();
+      }
       if (typeof track.setMuted === 'function') {
         await track.setMuted(nextMuted);
       } else {
@@ -213,20 +267,18 @@ export default function useAgora({ role, channelName, username }) {
       setIsMuted(nextMuted);
       mediaLog('info', 'agora audio mute toggled', { role, channelName, muted: nextMuted });
     } catch (err) {
-      mediaLog('warn', 'agora audio mute toggle failed', { role, channelName, reason: err.message });
+      mediaLog('warn', 'agora mute toggle failed', { role, channelName, reason: err.message });
     }
-  }, [channelName, isMuted, role]);
+  }, [channelName, isMuted, resumeAudioContext, role]);
+
+  // ── toggleCamera ──────────────────────────────────────────────────────
 
   const toggleCamera = useCallback(async () => {
     const track = localVideoTrackRef.current;
-    if (!track) return;
+    if (!track || !clientRef.current) return;
     const nextOff = !isCameraOff;
     try {
-      if (typeof track.setMuted === 'function') {
-        await track.setMuted(nextOff);
-      } else {
-        await track.setEnabled(!nextOff);
-      }
+      await track.setEnabled(!nextOff);
       setIsCameraOff(nextOff);
       mediaLog('info', 'agora camera toggled', { role, channelName, cameraOff: nextOff });
     } catch (err) {
@@ -234,12 +286,9 @@ export default function useAgora({ role, channelName, username }) {
     }
   }, [channelName, isCameraOff, role]);
 
-  useEffect(() => {
-    if (channelName && username && !isJoined && !isConnecting) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      joinChannel();
-    }
-  }, [channelName, username]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ── Lifecycle ─────────────────────────────────────────────────────────
+  // mountedRef is set once on mount and cleared on unmount.
+  // Empty dep array — intentional, this must run exactly once.
 
   useEffect(() => {
     mountedRef.current = true;
@@ -247,20 +296,20 @@ export default function useAgora({ role, channelName, username }) {
       mountedRef.current = false;
       leaveChannel();
     };
-  }, [leaveChannel]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
     localVideoRef,
     localVideoTrack,
-    remoteUsers,
     localAudioTrack,
+    remoteUsers,
     isJoined,
     isConnecting,
     isMuted,
     isCameraOff,
+    joinChannel,
+    leaveChannel,
     toggleMute,
     toggleCamera,
-    leaveChannel,
-    joinChannel,
   };
 }

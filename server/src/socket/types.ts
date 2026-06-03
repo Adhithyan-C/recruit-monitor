@@ -43,6 +43,10 @@ interface SharedServerToClientEvents {
     interviewerId:   string | null;
     participantUids: ParticipantUids;
   }) => void;
+  video_available:  (payload: { videoId: string; signedUrl: string; sharedBy: string }) => void;
+  video_play_sync:  (payload: { videoId: string; currentTime: number }) => void;
+  video_pause_sync: (payload: { videoId: string; currentTime: number }) => void;
+  video_seek_sync:  (payload: { videoId: string; currentTime: number }) => void;
 }
 
 // Staff (interviewer + supervisor) only — candidates never receive note events.
@@ -62,6 +66,10 @@ export interface InterviewerClientToServerEvents {
   add_note:         (payload: { meetingId: string; anchorSegmentId?: string | null; body: string }, ack: (r: Ack<{ noteId: string }>) => void) => void;
   update_note:      (payload: { meetingId: string; noteId: string; body: string },                ack: (r: Ack) => void) => void;
   delete_note:      (payload: { meetingId: string; noteId: string },                              ack: (r: Ack) => void) => void;
+  share_video:      (payload: { meetingId: string; videoId: string }) => void;
+  video_play:       (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
+  video_pause:      (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
+  video_seek:       (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
 }
 
 export interface InterviewerServerToClientEvents extends StaffServerToClientEvents {
@@ -98,6 +106,10 @@ export interface CandidateClientToServerEvents {
   add_note:      (payload: { meetingId: string; anchorSegmentId?: string | null; body: string }, ack: (r: Ack<{ noteId: string }>) => void) => void;
   update_note:   (payload: { meetingId: string; noteId: string; body: string }, ack: (r: Ack) => void) => void;
   delete_note:   (payload: { meetingId: string; noteId: string }, ack: (r: Ack) => void) => void;
+  share_video:   (payload: { meetingId: string; videoId: string }) => void;
+  video_play:    (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
+  video_pause:   (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
+  video_seek:    (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
 }
 
 export interface CandidateServerToClientEvents extends SharedServerToClientEvents {

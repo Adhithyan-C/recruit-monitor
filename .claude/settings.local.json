@@ -8,7 +8,24 @@
       "Bash(node --check server/src/socket/index.js)",
       "Bash(node --check server/src/socket/candidateHandlers.js)",
       "Bash(node --check server/src/services/deepgram/DeepgramManager.js)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(node --check server/src/routes/auth.js)",
+      "Bash(Remove-Item *)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:d[k] for k in ['exports','types','main','module'] if k in d}, indent=2\\)\\)\")",
+      "Bash(node *)",
+      "Bash(npx eslint *)",
+      "Bash(npm test *)",
+      "Bash(ls node_modules/agora-token/*.d.ts)",
+      "Bash(ls node_modules/agora-token/src/*.d.ts)",
+      "Bash(npm list *)",
+      "Bash(npx tsx *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(grep *)",
+      "Bash(dir *)"
     ]
   }
 }

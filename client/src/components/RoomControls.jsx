@@ -1,13 +1,15 @@
 export default function RoomControls({ role, isMuted, isCameraOff, onToggleMute, onToggleCamera, onEndCall }) {
   return (
-    <div className="flex items-center justify-between px-6 py-4 border-t border-surface-800 bg-surface-950/80 backdrop-blur-lg">
-      <div className="flex items-center gap-3">
+    <div className="flex items-center justify-between px-4 md:px-6 py-3 md:py-4 border-t border-surface-800 bg-surface-950 flex-shrink-0">
+      <div className="flex items-center gap-2 md:gap-3">
         {role !== 'supervisor' && (
           <>
-            {/* Mute Button */}
+            {/* Mute — active state uses danger-500/15 background (no gradient, no glow) */}
             <button
               onClick={onToggleMute}
-              className={`btn-icon ${isMuted ? 'bg-danger-500/20 border-danger-500/30 text-danger-400' : ''}`}
+              className={`btn-icon p-3.5 md:p-3 min-h-[44px] min-w-[44px] ${
+                isMuted ? 'bg-danger-500/15 border-danger-500/30 text-danger-400' : ''
+              }`}
               title={isMuted ? 'Unmute' : 'Mute'}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -19,10 +21,12 @@ export default function RoomControls({ role, isMuted, isCameraOff, onToggleMute,
               </svg>
             </button>
 
-            {/* Camera Button */}
+            {/* Camera */}
             <button
               onClick={onToggleCamera}
-              className={`btn-icon ${isCameraOff ? 'bg-danger-500/20 border-danger-500/30 text-danger-400' : ''}`}
+              className={`btn-icon p-3.5 md:p-3 min-h-[44px] min-w-[44px] ${
+                isCameraOff ? 'bg-danger-500/15 border-danger-500/30 text-danger-400' : ''
+              }`}
               title={isCameraOff ? 'Turn Camera On' : 'Turn Camera Off'}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -37,8 +41,11 @@ export default function RoomControls({ role, isMuted, isCameraOff, onToggleMute,
         )}
       </div>
 
-      {/* End Call */}
-      <button onClick={onEndCall} className="btn-danger flex items-center gap-2">
+      {/* End Call — solid danger-500, no gradient, narrower on mobile */}
+      <button
+        onClick={onEndCall}
+        className="btn-danger px-4 md:px-6 min-h-[44px] flex items-center gap-2"
+      >
         <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072M18.364 5.636a9 9 0 010 12.728M1.5 4.5l21 15" />
         </svg>
