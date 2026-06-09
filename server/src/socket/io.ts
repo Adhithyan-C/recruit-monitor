@@ -27,6 +27,7 @@ export interface SocketServerDeps {
 export function createSocketServer(
   httpServer: http.Server,
   deps: SocketServerDeps,
+  options: { redisAvailable?: boolean } = {},
 ): { broadcast: BroadcastHelper; io: Server } {
   const origins = env.CLIENT_ORIGIN.split(',').map((s) => s.trim());
 
@@ -34,9 +35,14 @@ export function createSocketServer(
     cors: { origin: origins, credentials: true },
   });
 
-  const pubClient = redis.duplicate();
-  const subClient = redis.duplicate();
-  io.adapter(createAdapter(pubClient, subClient));
+  if (options.redisAvailable && redis) {
+    const pubClient = redis.duplicate();
+    const subClient = redis.duplicate();
+    io.adapter(createAdapter(pubClient, subClient));
+    logger.info('Socket.IO Redis adapter attached');
+  } else {
+    logger.info('Socket.IO using in-memory adapter (Redis not available)');
+  }
 
   const broadcast = new BroadcastHelper(io, deps.meetingService);
 

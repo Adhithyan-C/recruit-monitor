@@ -51,7 +51,11 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
 
     await socket.join(`user:${userId}`);
 
-    const existingSockets = await nsp.in(`user:${userId}`).fetchSockets();
+    // Guard against fetchSockets hanging if the Redis adapter is slow or unreachable.
+    const existingSockets = await Promise.race([
+      nsp.in(`user:${userId}`).fetchSockets(),
+      new Promise<[]>((resolve) => setTimeout(() => resolve([]), 3_000)),
+    ]);
     for (const old of existingSockets) {
       if (old.id !== socket.id) {
         old.emit('session_replaced', {});
@@ -128,29 +132,29 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
         schema: startSessionSchema,
         rateLimit: { limit: 5, windowMs: 60_000 },
       }, async (_payload, { ack }) => {
-        if (socket.data.meetingId) {
-          // The candidate may have navigated back from an ended meeting without
-          // disconnecting the socket, leaving meetingId stale. Verify the meeting
-          // is still in a live state before blocking the new session.
-          try {
-            const existing = await meetingService.getMeeting(socket.data.meetingId);
-            if (existing.status !== 'ended') {
-              ack({ ok: false, error: 'Session already started', code: 'CONFLICT' });
-              return;
-            }
-          } catch (err) {
-            if (!(err instanceof NotFoundError)) {
-              logger.error({ err, meetingId: socket.data.meetingId }, 'start_session: stale meeting check failed');
-              ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
-              return;
-            }
-            // Meeting not found — treat meetingId as stale, fall through.
-          }
-          // Meeting ended or missing — clear stale meetingId and allow new session.
-          socket.data.meetingId = undefined;
-        }
-
         try {
+          if (socket.data.meetingId) {
+            // The candidate may have navigated back from an ended meeting without
+            // disconnecting the socket, leaving meetingId stale. Verify the meeting
+            // is still in a live state before blocking the new session.
+            try {
+              const existing = await meetingService.getMeeting(socket.data.meetingId);
+              if (existing.status !== 'ended') {
+                ack({ ok: false, error: 'Session already started', code: 'CONFLICT' });
+                return;
+              }
+            } catch (err) {
+              if (!(err instanceof NotFoundError)) {
+                logger.error({ err, meetingId: socket.data.meetingId }, 'start_session: stale meeting check failed');
+                ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+                return;
+              }
+              // Meeting not found — treat meetingId as stale, fall through.
+            }
+            // Meeting ended or missing — clear stale meetingId and allow new session.
+            socket.data.meetingId = undefined;
+          }
+
           const { meetingId, agoraChannel } = await meetingService.createOpenMeeting(userId);
 
           socket.data.meetingId     = meetingId;
@@ -180,15 +184,15 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
             participantUids,
           });
 
-          // Notify interviewer dashboards.
+          // Notify interviewer dashboards — fire-and-forget, must not block the ack.
           broadcast.openRoomsUpdate()
             .catch((err) => logger.error({ err }, 'openRoomsUpdate after start_session failed'));
 
           ack({ ok: true, data: { meetingId, agoraChannel, agoraToken, uid, participantUids } });
           logger.info({ socketId: socket.id, userId, meetingId }, 'start_session: open meeting created');
         } catch (err) {
-          logger.error({ err, userId }, 'start_session: createOpenMeeting failed');
-          ack({ ok: false, error: 'Failed to create session', code: 'INTERNAL_ERROR' });
+          logger.error({ err, userId }, 'start_session: unhandled error');
+          ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
         }
       });
     }

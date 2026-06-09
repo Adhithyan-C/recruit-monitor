@@ -94,9 +94,11 @@ export class BroadcastHelper {
   ): void {
     // Invalidate supervisor active-meetings cache so next subscribe_active_meetings
     // reflects the updated status. Fire-and-forget — stale cache is self-healing at TTL.
-    redis.del(...ACTIVE_MEETINGS_KEYS).catch((err: Error) =>
-      logger.error({ err }, 'meetingStatus: activemeetings cache invalidation failed'),
-    );
+    if (redis) {
+      redis.del(...ACTIVE_MEETINGS_KEYS).catch((err: Error) =>
+        logger.error({ err }, 'meetingStatus: activemeetings cache invalidation failed'),
+      );
+    }
 
     const payload = extra ? { meetingId, status, ...extra } : { meetingId, status };
     const room    = meetingRoom(meetingId);
@@ -107,24 +109,39 @@ export class BroadcastHelper {
   }
 
   /** Pushes each subscribed interviewer their own language-filtered list of open rooms.
-   *  Results are cached in Redis per language (5s TTL) so at most 3 DB queries fire
-   *  per broadcast cycle regardless of how many interviewers are connected. */
+   *  Results are cached in Redis per language (5s TTL) when Redis is available. */
   async openRoomsUpdate(): Promise<void> {
-    // Invalidate stale cache so the first socket per language re-fetches from DB.
-    await redis.del('openrooms:english', 'openrooms:tamil', 'openrooms:hindi');
+    const r = redis; // capture once; stable null check throughout async calls
 
-    const sockets = await this.io.of(INTERVIEWER_NSP).in('open_rooms_monitor').fetchSockets();
+    // Invalidate stale cache so the first socket per language re-fetches from DB.
+    if (r) {
+      await r.del('openrooms:english', 'openrooms:tamil', 'openrooms:hindi')
+        .catch((err: Error) => logger.error({ err }, 'openRoomsUpdate: cache invalidation failed'));
+    }
+
+    // Guard against fetchSockets hanging when the Redis adapter is slow or unavailable.
+    const sockets = await Promise.race([
+      this.io.of(INTERVIEWER_NSP).in('open_rooms_monitor').fetchSockets(),
+      new Promise<[]>((resolve) => setTimeout(() => resolve([]), 3_000)),
+    ]);
+
     for (const s of sockets) {
       try {
         const lang     = (s.data as { user?: InternalJwtPayload })?.user?.language ?? 'english';
         const cacheKey = `openrooms:${lang}`;
-        let cached     = await redis.get(cacheKey);
-        if (!cached) {
+
+        if (r) {
+          let cached = await r.get(cacheKey);
+          if (!cached) {
+            const rooms = await this.meetingService.getOpenMeetingsWithNames(lang);
+            cached = JSON.stringify(rooms);
+            await r.set(cacheKey, cached, 'EX', 5);
+          }
+          s.emit('open_rooms_update', { meetings: JSON.parse(cached) });
+        } else {
           const rooms = await this.meetingService.getOpenMeetingsWithNames(lang);
-          cached = JSON.stringify(rooms);
-          await redis.set(cacheKey, cached, 'EX', 5);
+          s.emit('open_rooms_update', { meetings: rooms });
         }
-        s.emit('open_rooms_update', { meetings: JSON.parse(cached) });
       } catch (err) {
         logger.error({ err, socketId: s.id }, 'openRoomsUpdate: per-socket failed');
       }

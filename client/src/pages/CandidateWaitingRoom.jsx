@@ -82,7 +82,14 @@ export default function CandidateWaitingRoom() {
     setStarting(true);
     setError('');
     const socket = getSocket('candidate');
+
+    const timeout = setTimeout(() => {
+      setStarting(false);
+      setError('Connection timeout. Please try again.');
+    }, 10_000);
+
     socket.emit('start_session', (ack) => {
+      clearTimeout(timeout);
       if (ack.ok) return;
       if (ack.code === 'CONFLICT') {
         setStarting(false);

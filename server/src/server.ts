@@ -10,7 +10,8 @@ import { logger } from './lib/logger.js';
 import { newId } from './lib/ids.js';
 import type { DomainError } from './lib/errors.js';
 import { pool, checkDbConnection } from './db/pool.js';
-import { BullScheduler } from './scheduler/bullScheduler.js';
+import { waitForRedis } from './db/redis.js';
+import { BullScheduler, MemoryScheduler } from './scheduler/bullScheduler.js';
 import { recoverScheduledJobs } from './scheduler/recovery.js';
 import { startPresenceSweeper } from './scheduler/sweeper.js';
 import { authRouter } from './http/auth.js';
@@ -94,12 +95,19 @@ async function main(): Promise<void> {
   await checkDbConnection();
   logger.info('database connected');
 
+  // 2b. Check Redis availability once before constructing Redis-dependent services.
+  //     Single 5-second window: if Redis isn't ready, fall back to in-memory for everything.
+  const redisAvailable = await waitForRedis(5_000);
+  if (!redisAvailable) {
+    logger.warn('Redis unavailable — using in-memory scheduler and no Socket.IO Redis adapter');
+  }
+
   // 3. Construct domain services.
   //    presenceService needs broadcast; createSocketServer needs presenceService.
   //    Break the cycle with a lazy ref assigned after socket server creation.
   const broadcastRef: { current?: BroadcastHelper } = {};
 
-  const scheduler = new BullScheduler();
+  const scheduler = redisAvailable ? new BullScheduler() : new MemoryScheduler();
 
   transcriptService = new TranscriptService({ pool });
 
@@ -194,7 +202,7 @@ async function main(): Promise<void> {
     transcriptService,
     sessionService,
     deepgramManager,
-  });
+  }, { redisAvailable });
   broadcastRef.current = broadcast;
 
   // 6. Start presence sweeper.

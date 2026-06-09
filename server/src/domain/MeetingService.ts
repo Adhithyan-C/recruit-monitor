@@ -366,9 +366,13 @@ export class MeetingService {
   }
 
   private async scheduleGraceExpiry(meetingId: string, disconnectedAt: Date): Promise<void> {
-    const runAt  = new Date(disconnectedAt.getTime() + this.deps.graceWindowSeconds * 1000);
-    const delay  = Math.max(0, runAt.getTime() - Date.now());
-    await this.deps.scheduler.schedule('grace_expiry', { meetingId }, delay, `grace_expiry:${meetingId}`);
+    const runAt = new Date(disconnectedAt.getTime() + this.deps.graceWindowSeconds * 1000);
+    const delay = Math.max(0, runAt.getTime() - Date.now());
+    try {
+      await this.deps.scheduler.schedule('grace_expiry', { meetingId }, delay, `grace_expiry:${meetingId}`);
+    } catch (err) {
+      logger.error({ err, meetingId }, 'scheduleGraceExpiry: failed — grace timer not set (Redis down?)');
+    }
   }
 
   /**
@@ -582,7 +586,8 @@ export class MeetingService {
 
       await client.query('COMMIT');
 
-      await this.deps.scheduler.cancel(`grace_expiry:${meetingId}`);
+      await this.deps.scheduler.cancel(`grace_expiry:${meetingId}`)
+        .catch((err) => logger.error({ err, meetingId }, 'onParticipantReconnect: cancel grace timer failed'));
       logger.info({ meetingId, userId }, 'participant reconnected — grace timer cancelled');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -646,7 +651,8 @@ export class MeetingService {
 
       await client.query('COMMIT');
 
-      await this.deps.scheduler.cancel(`grace_expiry:${meetingId}`);
+      await this.deps.scheduler.cancel(`grace_expiry:${meetingId}`)
+        .catch((err) => logger.error({ err, meetingId }, 'endMeeting: cancel grace timer failed'));
       await this.deps.transcriptService.flush(meetingId);
       this.deps.transcriptService.clearSeqCounter(meetingId);
       this.deps.deepgramManager.stop(meetingId);

@@ -51,16 +51,21 @@ export function registerSupervisorNamespace(io: Server, deps: SupervisorDeps): v
       const lang     = socket.data.user?.language ?? 'english';
       const cacheKey = `activemeetings:${lang}`;
       let meetings: MeetingDetailsWithNames[];
-      try {
-        const cached = await redis.get(cacheKey);
-        if (cached) {
-          meetings = JSON.parse(cached) as MeetingDetailsWithNames[];
-        } else {
+      if (redis) {
+        const r = redis; // capture narrowed reference across awaits
+        try {
+          const cached = await r.get(cacheKey);
+          if (cached) {
+            meetings = JSON.parse(cached) as MeetingDetailsWithNames[];
+          } else {
+            meetings = await meetingService.getActiveMeetingsWithNames(lang);
+            await r.set(cacheKey, JSON.stringify(meetings), 'EX', 5);
+          }
+        } catch (err) {
+          logger.error({ err }, 'subscribe_active_meetings: cache failed, falling back to DB');
           meetings = await meetingService.getActiveMeetingsWithNames(lang);
-          await redis.set(cacheKey, JSON.stringify(meetings), 'EX', 5);
         }
-      } catch (err) {
-        logger.error({ err }, 'subscribe_active_meetings: cache failed, falling back to DB');
+      } else {
         meetings = await meetingService.getActiveMeetingsWithNames(lang);
       }
       ack({ ok: true, data: { meetings } });
