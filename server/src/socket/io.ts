@@ -1,4 +1,5 @@
 import { Server } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
 import type http from 'http';
 import type { MeetingService } from '../domain/MeetingService.js';
 import type { PresenceService } from '../domain/PresenceService.js';
@@ -7,6 +8,7 @@ import type { TranscriptService } from '../domain/TranscriptService.js';
 import type { SessionService } from '../domain/SessionService.js';
 import type { DeepgramManager } from '../lib/DeepgramManager.js';
 import { env } from '../config/env.js';
+import { redis } from '../db/redis.js';
 import { BroadcastHelper } from './broadcast.js';
 import { registerInterviewerNamespace } from './namespaces/interviewer.js';
 import { registerCandidateNamespace } from './namespaces/candidate.js';
@@ -31,6 +33,10 @@ export function createSocketServer(
   const io = new Server(httpServer, {
     cors: { origin: origins, credentials: true },
   });
+
+  const pubClient = redis.duplicate();
+  const subClient = redis.duplicate();
+  io.adapter(createAdapter(pubClient, subClient));
 
   const broadcast = new BroadcastHelper(io, deps.meetingService);
 

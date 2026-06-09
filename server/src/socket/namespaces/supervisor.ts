@@ -1,8 +1,10 @@
 import type { Server } from 'socket.io';
-import type { MeetingService } from '../../domain/MeetingService.js';
+import type { MeetingService, MeetingDetailsWithNames } from '../../domain/MeetingService.js';
 import type { TranscriptService } from '../../domain/TranscriptService.js';
 import { AgoraTokenService } from '../../domain/AgoraTokenService.js';
 import type { SessionService } from '../../domain/SessionService.js';
+import { pool } from '../../db/pool.js';
+import { redis } from '../../db/redis.js';
 import { requireJwtSocket } from '../middleware/requireJwtSocket.js';
 import { attachReconnectSession } from '../middleware/attachReconnectSession.js';
 import { joinRoomSchema } from '../schemas/supervisor.js';
@@ -46,8 +48,21 @@ export function registerSupervisorNamespace(io: Server, deps: SupervisorDeps): v
       rateLimit: { limit: 20, windowMs: 60_000 },
     }, async (_payload, { ack }) => {
       await socket.join('meetings_monitor');
-      const lang = socket.data.user?.language ?? 'english';
-      const meetings = await meetingService.getActiveMeetingsWithNames(lang);
+      const lang     = socket.data.user?.language ?? 'english';
+      const cacheKey = `activemeetings:${lang}`;
+      let meetings: MeetingDetailsWithNames[];
+      try {
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+          meetings = JSON.parse(cached) as MeetingDetailsWithNames[];
+        } else {
+          meetings = await meetingService.getActiveMeetingsWithNames(lang);
+          await redis.set(cacheKey, JSON.stringify(meetings), 'EX', 5);
+        }
+      } catch (err) {
+        logger.error({ err }, 'subscribe_active_meetings: cache failed, falling back to DB');
+        meetings = await meetingService.getActiveMeetingsWithNames(lang);
+      }
       ack({ ok: true, data: { meetings } });
       logger.debug({ userId, count: meetings.length, lang }, 'supervisor subscribed to active meetings');
     });
@@ -57,6 +72,30 @@ export function registerSupervisorNamespace(io: Server, deps: SupervisorDeps): v
       schema: joinRoomSchema,
       rateLimit: { limit: 30, windowMs: 60_000 },
     }, async ({ meetingId }, { ack }) => {
+      // Language pre-flight — supervisors may only observe meetings whose candidate
+      // shares their language, matching the same constraint applied to interviewers.
+      try {
+        const { rows: langRows } = await pool.query<{ language: string }>(
+          `SELECT u.language
+             FROM meetings m
+             JOIN users u ON u.id = m.candidate_id
+            WHERE m.id = $1`,
+          [meetingId],
+        );
+        if (langRows.length > 0) {
+          const candidateLang  = langRows[0]!.language;
+          const supervisorLang = socket.data.user?.language ?? 'english';
+          if (candidateLang !== supervisorLang) {
+            ack({ ok: false, error: 'Language mismatch', code: 'FORBIDDEN' });
+            return;
+          }
+        }
+      } catch (err) {
+        logger.error({ err, meetingId }, 'supervisor join_room: language pre-flight failed');
+        ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+        return;
+      }
+
       try {
         const meeting = await meetingService.getMeeting(meetingId);
         const uid = AgoraTokenService.deriveUid(meetingId, userId);

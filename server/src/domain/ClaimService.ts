@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import type { JobScheduler } from '../scheduler/JobScheduler.js';
+import type { IScheduler } from '../scheduler/bullScheduler.js';
 import { logger } from '../lib/logger.js';
 import { newId } from '../lib/ids.js';
 import { NotFoundError, InvalidTransitionError } from '../lib/errors.js';
@@ -12,7 +12,7 @@ import {
 
 export interface ClaimServiceDeps {
   pool: Pool;
-  scheduler: JobScheduler;
+  scheduler: IScheduler;
   claimTtlSeconds: number;
   /** Called after a candidate is successfully restored to 'waiting' on claim expiry. */
   onCandidateRequeued: (candidateId: string) => Promise<void>;
@@ -36,13 +36,10 @@ export class ClaimService {
    * Schedules (or reschedules) the claim expiry timer for a meeting.
    * Called after a successful claim and by recovery at boot.
    */
-  scheduleClaimExpiry(meetingId: string, claimedAt: Date): void {
+  async scheduleClaimExpiry(meetingId: string, claimedAt: Date): Promise<void> {
     const runAt = new Date(claimedAt.getTime() + this.deps.claimTtlSeconds * 1000);
-    this.deps.scheduler.schedule(
-      `claim_expiry:${meetingId}`,
-      runAt,
-      () => this.onClaimExpired(meetingId),
-    );
+    const delay = Math.max(0, runAt.getTime() - Date.now());
+    await this.deps.scheduler.schedule('claim_expiry', { meetingId }, delay, `claim_expiry:${meetingId}`);
   }
 
   /**
@@ -93,9 +90,9 @@ export class ClaimService {
 
       await client.query('COMMIT');
 
-      // Timer registered after commit. If process crashes here, recovery at next
-      // boot finds status='claimed' and reschedules via onClaimExpired callback.
-      this.scheduleClaimExpiry(meetingId, claimedAt);
+      // Timer registered after commit. BullMQ persists the job in Redis so it
+      // survives restarts — no manual recovery needed.
+      await this.scheduleClaimExpiry(meetingId, claimedAt);
       logger.info({ meetingId, interviewerId, candidateId }, 'candidate claimed');
       return meetingId;
     } catch (err) {

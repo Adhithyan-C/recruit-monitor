@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import type { JobScheduler } from '../scheduler/JobScheduler.js';
+import type { IScheduler } from '../scheduler/bullScheduler.js';
 import type { TranscriptService } from './TranscriptService.js';
 import type { DeepgramManager } from '../lib/DeepgramManager.js';
 import { logger } from '../lib/logger.js';
@@ -15,7 +15,7 @@ import {
 
 export interface MeetingServiceDeps {
   pool: Pool;
-  scheduler: JobScheduler;
+  scheduler: IScheduler;
   graceWindowSeconds: number;
   transcriptService: TranscriptService;
   deepgramManager: DeepgramManager;
@@ -365,13 +365,10 @@ export class MeetingService {
     };
   }
 
-  private scheduleGraceExpiry(meetingId: string, disconnectedAt: Date): void {
-    const runAt = new Date(disconnectedAt.getTime() + this.deps.graceWindowSeconds * 1000);
-    this.deps.scheduler.schedule(
-      `grace_expiry:${meetingId}`,
-      runAt,
-      () => this.onGraceExpired(meetingId),
-    );
+  private async scheduleGraceExpiry(meetingId: string, disconnectedAt: Date): Promise<void> {
+    const runAt  = new Date(disconnectedAt.getTime() + this.deps.graceWindowSeconds * 1000);
+    const delay  = Math.max(0, runAt.getTime() - Date.now());
+    await this.deps.scheduler.schedule('grace_expiry', { meetingId }, delay, `grace_expiry:${meetingId}`);
   }
 
   /**
@@ -522,7 +519,7 @@ export class MeetingService {
 
       await client.query('COMMIT');
 
-      this.scheduleGraceExpiry(meetingId, now);
+      await this.scheduleGraceExpiry(meetingId, now);
       logger.info({ meetingId, userId }, 'meeting interrupted — grace timer started');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -585,7 +582,7 @@ export class MeetingService {
 
       await client.query('COMMIT');
 
-      this.deps.scheduler.cancel(`grace_expiry:${meetingId}`);
+      await this.deps.scheduler.cancel(`grace_expiry:${meetingId}`);
       logger.info({ meetingId, userId }, 'participant reconnected — grace timer cancelled');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -649,7 +646,8 @@ export class MeetingService {
 
       await client.query('COMMIT');
 
-      this.deps.scheduler.cancel(`grace_expiry:${meetingId}`);
+      await this.deps.scheduler.cancel(`grace_expiry:${meetingId}`);
+      await this.deps.transcriptService.flush(meetingId);
       this.deps.transcriptService.clearSeqCounter(meetingId);
       this.deps.deepgramManager.stop(meetingId);
       logger.info({ meetingId, reason }, 'meeting ended');

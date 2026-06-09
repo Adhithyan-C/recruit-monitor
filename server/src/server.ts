@@ -10,7 +10,7 @@ import { logger } from './lib/logger.js';
 import { newId } from './lib/ids.js';
 import type { DomainError } from './lib/errors.js';
 import { pool, checkDbConnection } from './db/pool.js';
-import { JobScheduler } from './scheduler/JobScheduler.js';
+import { BullScheduler } from './scheduler/bullScheduler.js';
 import { recoverScheduledJobs } from './scheduler/recovery.js';
 import { startPresenceSweeper } from './scheduler/sweeper.js';
 import { authRouter } from './http/auth.js';
@@ -99,7 +99,7 @@ async function main(): Promise<void> {
   //    Break the cycle with a lazy ref assigned after socket server creation.
   const broadcastRef: { current?: BroadcastHelper } = {};
 
-  const scheduler = new JobScheduler();
+  const scheduler = new BullScheduler();
 
   transcriptService = new TranscriptService({ pool });
 
@@ -146,7 +146,17 @@ async function main(): Promise<void> {
     onBroadcast: async (candidates) => { broadcastRef.current?.presenceDelta(candidates); },
   });
 
-  // 3b. Register service-dependent HTTP routes.
+  // 3b. Register BullMQ handlers then start the worker. Worker starts after all
+  //     services are wired so handlers can safely close over service instances.
+  scheduler.registerHandler('grace_expiry', async ({ meetingId }) => {
+    await meetingService.onGraceExpired(meetingId as string);
+  });
+  scheduler.registerHandler('claim_expiry', async ({ meetingId }) => {
+    await claimService.onClaimExpired(meetingId as string);
+  });
+  scheduler.start();
+
+  // 3c. Register service-dependent HTTP routes.
   //     The error handler must come AFTER these routes so next(err) reaches it.
   app.use('/meetings', createMeetingsRouter(meetingService, transcriptService));
   app.use('/meetings', createVideosRouter(meetingService, pool));
@@ -173,14 +183,7 @@ async function main(): Promise<void> {
   logger.info('domain services constructed');
 
   // 4. Reconstruct any in-flight scheduled jobs that were lost on last restart.
-  await recoverScheduledJobs({
-    pool,
-    scheduler,
-    claimTtlSeconds: env.CLAIM_TTL_SECONDS,
-    graceWindowSeconds: env.GRACE_WINDOW_SECONDS,
-    onClaimExpired: (meetingId) => claimService.onClaimExpired(meetingId),
-    onGraceExpired: (meetingId) => meetingService.onGraceExpired(meetingId),
-  });
+  await recoverScheduledJobs({ pool });
 
   // 5. Attach socket server — must happen before listen() so the upgrade
   //    handler is in place.
@@ -242,7 +245,7 @@ async function main(): Promise<void> {
   function shutdown(signal: string): void {
     logger.info({ signal }, 'shutting down');
     sweeper.stop();
-    scheduler.cancelAll();
+    scheduler.close().catch(() => {});
     deepgramManager.stopAll();
     io.close(() => {
       pool.end().then(() => {

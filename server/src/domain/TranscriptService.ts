@@ -51,18 +51,31 @@ export interface NoteRow {
   updatedAt: Date;
 }
 
-export class TranscriptService {
-  private readonly seqCounters = new Map<string, number>();
+interface BufferedSegment {
+  id: string;
+  seq: number;
+  params: AppendSegmentParams;
+}
 
-  constructor(private readonly deps: TranscriptServiceDeps) {}
+const BATCH_SIZE    = 20;
+const FLUSH_INTERVAL_MS = 500;
+
+export class TranscriptService {
+  private readonly seqCounters   = new Map<string, number>();
+  private readonly segmentBuffer = new Map<string, BufferedSegment[]>();
+  private readonly flushTimer: ReturnType<typeof setInterval>;
+
+  constructor(private readonly deps: TranscriptServiceDeps) {
+    this.flushTimer = setInterval(() => {
+      this.flush().catch((err) => logger.error({ err }, 'transcript interval flush failed'));
+    }, FLUSH_INTERVAL_MS);
+    this.flushTimer.unref();
+  }
 
   /**
-   * Appends a Deepgram segment (interim or final).
-   * Seq is assigned from an in-memory counter keyed by meetingId, hydrated from
-   * MAX(seq) on the first append for a given meeting. No DB lock required —
-   * Deepgram streams one segment at a time per meeting, so concurrent appends
-   * for the same meeting are not expected. If the INSERT fails, the counter is
-   * rolled back so the next call does not skip a seq.
+   * Assigns a seq number and buffers the segment for a batch DB write.
+   * Returns immediately — the broadcast path is not delayed.
+   * The DB write is flushed every 500ms or when the buffer reaches 20 segments.
    */
   async appendSegment(params: AppendSegmentParams): Promise<{ id: string; seq: number }> {
     if (!this.seqCounters.has(params.meetingId)) {
@@ -79,27 +92,71 @@ export class TranscriptService {
     this.seqCounters.set(params.meetingId, seq);
     const id = newId();
 
-    try {
-      await this.deps.pool.query(
-        `INSERT INTO transcript_segments
-           (id, meeting_id, seq, speaker_user_id, speaker_role,
-            text, started_at, ended_at, is_final, confidence)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [
-          id, params.meetingId, seq, params.speakerUserId, params.speakerRole,
-          params.text, params.startedAt, params.endedAt, params.isFinal, params.confidence,
-        ],
-      );
-    } catch (err) {
-      this.seqCounters.set(params.meetingId, seq - 1);
-      throw err;
+    const buffer = this.segmentBuffer.get(params.meetingId) ?? [];
+    buffer.push({ id, seq, params });
+    this.segmentBuffer.set(params.meetingId, buffer);
+
+    if (buffer.length >= BATCH_SIZE) {
+      await this.flush(params.meetingId);
     }
 
-    logger.debug({ meetingId: params.meetingId, seq, isFinal: params.isFinal }, 'segment appended');
+    logger.debug({ meetingId: params.meetingId, seq, isFinal: params.isFinal }, 'segment buffered');
     return { id, seq };
   }
 
-  /** Evicts the seq counter for a meeting. Called by MeetingService on endMeeting. */
+  /**
+   * Flushes buffered segments to the DB.
+   * If meetingId is given, flushes only that meeting (used on meeting end).
+   * If omitted, flushes all buffered meetings (used by the interval timer).
+   */
+  async flush(meetingId?: string): Promise<void> {
+    const targets = meetingId !== undefined
+      ? (this.segmentBuffer.has(meetingId) ? [meetingId] : [])
+      : Array.from(this.segmentBuffer.keys());
+
+    for (const mid of targets) {
+      const buffer = this.segmentBuffer.get(mid);
+      if (!buffer || buffer.length === 0) {
+        this.segmentBuffer.delete(mid);
+        continue;
+      }
+      this.segmentBuffer.delete(mid);
+      try {
+        await this.insertBatch(buffer);
+      } catch (err) {
+        logger.error({ err, meetingId: mid, count: buffer.length }, 'transcript batch flush failed');
+      }
+    }
+  }
+
+  private async insertBatch(segments: BufferedSegment[]): Promise<void> {
+    if (segments.length === 0) return;
+
+    const ids         = segments.map((s) => s.id);
+    const meetingIds  = segments.map((s) => s.params.meetingId);
+    const seqs        = segments.map((s) => s.seq);
+    const speakerIds  = segments.map((s) => s.params.speakerUserId);
+    const roles       = segments.map((s) => s.params.speakerRole);
+    const texts       = segments.map((s) => s.params.text);
+    const startedAts  = segments.map((s) => s.params.startedAt);
+    const endedAts    = segments.map((s) => s.params.endedAt);
+    const isFinals    = segments.map((s) => s.params.isFinal);
+    const confidences = segments.map((s) => s.params.confidence);
+
+    await this.deps.pool.query(
+      `INSERT INTO transcript_segments
+         (id, meeting_id, seq, speaker_user_id, speaker_role,
+          text, started_at, ended_at, is_final, confidence)
+       SELECT * FROM unnest(
+         $1::text[], $2::text[], $3::int[], $4::text[], $5::text[],
+         $6::text[], $7::timestamptz[], $8::timestamptz[], $9::bool[], $10::float8[]
+       )`,
+      [ids, meetingIds, seqs, speakerIds, roles, texts, startedAts, endedAts, isFinals, confidences],
+    );
+    logger.debug({ count: segments.length }, 'transcript batch written');
+  }
+
+  /** Evicts the seq counter for a meeting. Called by MeetingService on endMeeting after flush. */
   clearSeqCounter(meetingId: string): void {
     this.seqCounters.delete(meetingId);
   }
@@ -107,7 +164,6 @@ export class TranscriptService {
   /**
    * Returns segments in seq order.
    * afterSeq is exclusive — pass the last seq seen for cursor-based pagination.
-   * Uses idx_transcript_segments_meeting_seq.
    */
   async getSegments(
     meetingId: string,
@@ -137,17 +193,17 @@ export class TranscriptService {
     );
 
     return rows.map((r) => ({
-      id: r.id,
-      meetingId: r.meeting_id,
-      seq: r.seq,
+      id:            r.id,
+      meetingId:     r.meeting_id,
+      seq:           r.seq,
       speakerUserId: r.speaker_user_id,
-      speakerRole: r.speaker_role,
-      text: r.text,
-      startedAt: r.started_at,
-      endedAt: r.ended_at,
-      isFinal: r.is_final,
-      confidence: r.confidence,
-      createdAt: r.created_at,
+      speakerRole:   r.speaker_role,
+      text:          r.text,
+      startedAt:     r.started_at,
+      endedAt:       r.ended_at,
+      isFinal:       r.is_final,
+      confidence:    r.confidence,
+      createdAt:     r.created_at,
     }));
   }
 
@@ -182,8 +238,6 @@ export class TranscriptService {
   /**
    * Adds an interviewer note, optionally anchored to a segment.
    * Validates that anchorSegmentId, if given, belongs to the same meeting.
-   * Interviewer corrections are expressed as notes — segments are never mutated.
-   * Returns the full NoteRow so callers can broadcast without a second read.
    */
   async addNote(params: AddNoteParams): Promise<NoteRow> {
     if (params.anchorSegmentId !== null) {

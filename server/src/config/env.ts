@@ -21,6 +21,8 @@ const schema = z.object({
 
   CLIENT_ORIGIN: z.string().min(1, 'Comma-separated list of allowed origins'),
 
+  REDIS_URL: z.string().url(),
+
   GRACE_WINDOW_SECONDS: z.coerce.number().int().positive().default(30),
   CLAIM_TTL_SECONDS: z.coerce.number().int().positive().default(60),
   PRESENCE_HEARTBEAT_INTERVAL_SECONDS: z.coerce.number().int().positive().default(10),
