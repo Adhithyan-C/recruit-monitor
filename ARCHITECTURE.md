@@ -1,10 +1,20 @@
-# RecruitMonitor — Architecture Document
+# RecruitMonitor — Architecture Reference
+
+> **Last updated: June 2025.** Source of truth: read the code. This document is a navigation guide, not a spec.
 
 ---
 
-## 1. System Overview
+## 1. Overview
 
-RecruitMonitor is a real-time interview monitoring platform that connects three roles over live video: **candidates** join a waiting room and are automatically transcribed by Deepgram Nova-2 while speaking; **interviewers** browse a language-filtered queue of waiting candidates and join their solo room to conduct the interview; **supervisors** silently monitor any active interview in stealth mode (subscriber-only Agora token, presence hidden from other participants). Every spoken word from the candidate is transcribed server-side and broadcast to all participants in real time. Interviewers can annotate the transcript with timestamped notes, and both parties can share or record video resumes that play back in synchronized lockstep.
+RecruitMonitor is a real-time interview monitoring platform with three roles:
+
+| Role | Entry point | Agora mode | Socket namespace |
+|------|------------|------------|-----------------|
+| Candidate | `/join/:code` | Publisher (video + audio) | `/candidate` |
+| Interviewer | `/interviewer` dashboard | Publisher (video + audio) | `/interviewer` |
+| Supervisor | `/supervisor` dashboard | Subscriber only (no publish) | `/supervisor` |
+
+Interviews are language-separated (English / Tamil / Hindi). Interviewers only see rooms in their own language. Supervisors joining a cross-language meeting are explicitly rejected (`FORBIDDEN`).
 
 ---
 
@@ -12,739 +22,770 @@ RecruitMonitor is a real-time interview monitoring platform that connects three 
 
 ### Server (`server/`)
 
-| Library | Version | Role |
-|---|---|---|
-| Node.js | ≥22 | Runtime |
-| TypeScript | ^5.5 | Language (strict, NodeNext modules) |
-| Express | ^4.19 | HTTP server + REST API |
-| Socket.IO | ^4.7 | WebSocket server — three namespaces |
-| `pg` (node-postgres) | ^8.12 | PostgreSQL client, connection pool (max 20) |
-| Supabase JS (`@supabase/supabase-js`) | ^2.45 | Auth token verification, Storage signed URLs |
-| `jsonwebtoken` | ^9.0 | Internal JWT issue + verify (HS256, 15-min TTL) |
-| `@deepgram/sdk` | ^3.5 | Live transcription WebSocket client |
-| `agora-token` | ^2.0.4 | RTC token generation (CJS, loaded via `createRequire`) |
-| Zod | ^3.23 | Env validation at boot; socket payload validation |
-| Pino + pino-http | ^9.3 / ^10 | Structured JSON logging |
-| Helmet | ^7.1 | HTTP security headers |
-| express-rate-limit | ^7.4 | HTTP-level rate limiting on `/auth` |
-| `uuid` | ^10 | UUIDs for all IDs (`newId()` = `uuidv4()`) |
-| tsx | ^4.16 | TypeScript execution in dev mode |
+| Layer | Package | Version | Notes |
+|-------|---------|---------|-------|
+| Runtime | Node.js | 22 (alpine) | `node --import tsx/esm src/server.ts` |
+| HTTP | Express | 4.x | `cors`, `helmet`, `pino-http` |
+| WebSockets | Socket.IO | 4.7 | 3 namespaces; Redis adapter optional |
+| Database | `pg` | 8.12 | Pool **max 50**; non-pooled Supabase connection (port 6543) |
+| Redis | `ioredis` | 5.11 | **Optional** — `null` when `REDIS_URL` absent |
+| Socket.IO adapter | `@socket.io/redis-adapter` | 8.3 | Attached only when Redis is available |
+| Job queue | `bullmq` | 5.78 | Persistent delayed jobs; Redis-backed; falls back to `MemoryScheduler` |
+| Auth — internal | `jsonwebtoken` | 9.x | HS256, 15m TTL, 1h refresh grace |
+| Auth — Supabase | `@supabase/supabase-js` | 2.x | Token verification + Storage |
+| Transcription | `@deepgram/sdk` | 3.5 | Nova-2 live; server-side pipeline |
+| Video tokens | `agora-token` | 2.0.4 | Server-side RTC token generation |
+| Logging | `pino` | 9.x | JSON structured logging |
+| Validation | `zod` | 3.x | Env schema; `process.exit(1)` on missing vars |
 
 ### Client (`client/`)
 
-| Library | Version | Role |
-|---|---|---|
-| React | ^19.2 | UI framework (no StrictMode — intentional) |
-| React Router DOM | ^7.15 | SPA routing, `ProtectedRoute` + `RoomGuard` |
-| Vite | ^8.0 | Build tool + dev server |
-| Tailwind CSS | ^3.4 | Styling (custom `primary`/`surface`/`success`/`danger`/`warning` palette) |
-| Zustand | ^5.0 | Client state — three stores |
-| Socket.IO Client | ^4.8 | WebSocket client, module-level singletons |
-| agora-rtc-sdk-ng | ^4.24 | Agora RTC browser SDK |
-| `@supabase/supabase-js` | ^2.106 | Supabase auth (signUp, signInWithPassword) |
-| Geist / JetBrains Mono | via fontsource | Typography |
+| Layer | Package | Version | Notes |
+|-------|---------|---------|-------|
+| Framework | React | 19 | No StrictMode (breaks Agora/Socket.IO lifecycle) |
+| Build | Vite | 6.x | `@vitejs/plugin-react` |
+| Styling | Tailwind CSS | 3.x | Teal primary, zinc surface, Geist font |
+| State | Zustand | 5.0.13 | 3 stores: auth, meeting, transcript |
+| WebSockets | `socket.io-client` | 4.7 | Module-level singleton sockets |
+| Video / Audio | `agora-rtc-sdk-ng` | 4.24.3 | `useAgora` hook |
+| HTTP | `axios` | 1.x | Auth interceptor; `/api` proxy via Vite |
 
 ---
 
-## 3. Database Schema
+## 3. Project Structure
 
-PostgreSQL hosted on Supabase. Migrations applied via `server/src/db/migrate.ts` (sequential `.sql` files in `server/migrations/`, tracked in `schema_migrations`).
-
-### Tables
-
-#### `users`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK — mirrors Supabase `auth.users.id` |
-| `email` | TEXT | NOT NULL, UNIQUE |
-| `role` | `user_role` enum | NOT NULL — `candidate`, `interviewer`, `supervisor` |
-| `name` | TEXT | NOT NULL |
-| `org_id` | UUID | nullable |
-| `created_at` | TIMESTAMPTZ | DEFAULT now() |
-| `language` | TEXT | NOT NULL, DEFAULT `'english'`, CHECK IN (`english`,`tamil`,`hindi`) — migration 0005 |
-
-#### `meetings`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK DEFAULT gen_random_uuid() |
-| `candidate_id` | UUID | NOT NULL, FK → users |
-| `interviewer_id` | UUID | nullable (NULL until interviewer joins) — migration 0003 |
-| `status` | `meeting_status` enum | NOT NULL, DEFAULT `waiting` |
-| `agora_channel` | TEXT | NOT NULL, UNIQUE |
-| `created_at` | TIMESTAMPTZ | NOT NULL |
-| `started_at` | TIMESTAMPTZ | nullable — set when status → active |
-| `ended_at` | TIMESTAMPTZ | nullable |
-| `end_reason` | `end_reason` enum | nullable |
-
-**`meeting_status` values:**
-- `open` — candidate created solo room; no interviewer yet (primary flow)
-- `waiting` — legacy queue state
-- `claimed` — legacy: interviewer reserved candidate
-- `connecting` — legacy: both sides initializing Agora
-- `active` — both peers live in Agora channel
-- `interrupted` — one participant disconnected; 30-second grace window
-- `ended` — terminal: meeting concluded
-- `cancelled` — terminal: cancelled before active
-
-#### `candidate_presence`
-| Column | Type | Constraints |
-|---|---|---|
-| `user_id` | UUID | PK, FK → users ON DELETE CASCADE |
-| `status` | `candidate_status` enum | NOT NULL, DEFAULT `offline` |
-| `socket_id` | TEXT | nullable |
-| `last_heartbeat_at` | TIMESTAMPTZ | nullable |
-| `claimed_by` | UUID | nullable, FK → users |
-| `claimed_at` | TIMESTAMPTZ | nullable |
-| `current_meeting_id` | UUID | nullable, FK → meetings |
-| `updated_at` | TIMESTAMPTZ | NOT NULL |
-
-#### `meeting_participants`
-| Column | Type | Constraints |
-|---|---|---|
-| `meeting_id` | UUID | PK composite, FK → meetings ON DELETE CASCADE |
-| `user_id` | UUID | PK composite, FK → users |
-| `role` | `participant_role` enum | NOT NULL |
-| `agora_uid` | INTEGER | NOT NULL |
-| `joined_at` | TIMESTAMPTZ | DEFAULT now() |
-| `left_at` | TIMESTAMPTZ | nullable |
-| `disconnected_at` | TIMESTAMPTZ | nullable — used by recovery.ts to reconstruct grace timers |
-
-#### `sessions`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK |
-| `user_id` | UUID | FK → users ON DELETE CASCADE |
-| `reconnect_token` | TEXT | UNIQUE — 256-bit URL-safe base64 |
-| `expires_at` | TIMESTAMPTZ | NOT NULL |
-| `created_at` | TIMESTAMPTZ | NOT NULL |
-
-#### `transcript_segments`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK |
-| `meeting_id` | UUID | FK → meetings ON DELETE CASCADE |
-| `seq` | INTEGER | NOT NULL, UNIQUE (meeting_id, seq) |
-| `speaker_user_id` | UUID | nullable (null for system/gap segments) |
-| `speaker_role` | `speaker_role` enum | NOT NULL — `candidate`, `interviewer`, `system` |
-| `text` | TEXT | NOT NULL |
-| `started_at` / `ended_at` | TIMESTAMPTZ | NOT NULL |
-| `is_final` | BOOLEAN | NOT NULL, DEFAULT false |
-| `confidence` | FLOAT | nullable |
-| `created_at` | TIMESTAMPTZ | NOT NULL |
-
-#### `transcript_notes`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK |
-| `meeting_id` | UUID | FK → meetings |
-| `anchor_segment_id` | UUID | nullable, FK → transcript_segments |
-| `author_user_id` | UUID | NOT NULL, FK → users |
-| `body` | TEXT | NOT NULL |
-| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL |
-
-#### `meeting_videos`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK |
-| `meeting_id` | UUID | FK → meetings ON DELETE CASCADE |
-| `candidate_id` / `interviewer_id` | UUID | FKs → users |
-| `candidate_name` / `interviewer_name` | TEXT | denormalized display names |
-| `storage_path` | TEXT | NOT NULL — Supabase Storage key: `{meetingId}/{uuid}-{filename}` |
-| `type` | TEXT | CHECK IN (`candidate_upload`, `interviewer_recording`) |
-| `meeting_date` / `created_at` | TIMESTAMPTZ | NOT NULL |
-
-### Indexes
 ```
-UNIQUE one_active_meeting_per_candidate ON meetings(candidate_id)
-  WHERE status IN ('open','claimed','connecting','active','interrupted')
-
-idx_meetings_status_candidate          ON meetings(status, candidate_id)
-idx_meetings_interviewer_status        ON meetings(interviewer_id, status)
-idx_transcript_segments_meeting_seq    ON transcript_segments(meeting_id, seq)
-idx_candidate_presence_status_heartbeat ON candidate_presence(status, last_heartbeat_at)
-idx_sessions_expires_at                ON sessions(expires_at)
-idx_sessions_user_id                   ON sessions(user_id)
-meeting_videos_meeting_id              ON meeting_videos(meeting_id)
-```
-
-### Relationship diagram
-```
-users ──────────────────────────────────────────────────┐
-  │  (candidate_id)                                      │
-  ├──► meetings ──────────► transcript_segments          │
-  │        │                     │                       │
-  │        ├──► meeting_participants                     │
-  │        ├──► transcript_notes ──► transcript_segments │
-  │        └──► meeting_videos                           │
-  │                                                      │
-  └──► candidate_presence                                │
-  └──► sessions                                          │
-  └────────────────────────────────────────────────────── (all FKs)
+interview-platform/
+├── client/
+│   ├── src/
+│   │   ├── App.jsx                    # Routes, ProtectedRoute, RoomGuard, AppInit
+│   │   ├── main.jsx                   # No StrictMode — deliberate
+│   │   ├── index.css                  # Component classes: glass-card, btn-*, etc.
+│   │   ├── pages/
+│   │   │   ├── LoginPage.jsx
+│   │   │   ├── RegisterPage.jsx
+│   │   │   ├── CandidateJoinPage.jsx
+│   │   │   ├── CandidateWaitingRoom.jsx
+│   │   │   ├── InterviewerDashboard.jsx
+│   │   │   ├── SupervisorDashboard.jsx
+│   │   │   └── InterviewRoom.jsx
+│   │   ├── components/
+│   │   │   ├── VideoGrid.jsx
+│   │   │   ├── TranscriptBox.jsx
+│   │   │   ├── NotesPanel.jsx
+│   │   │   ├── HistoryPanel.jsx
+│   │   │   ├── VideoResumePanel.jsx
+│   │   │   ├── RoomControls.jsx
+│   │   │   ├── ParticipantPanel.jsx
+│   │   │   ├── ActiveRoomCard.jsx
+│   │   │   └── CandidateHistoryModal.jsx
+│   │   ├── hooks/
+│   │   │   ├── useSocket.js           # Module-level singletons; reconnect session storage
+│   │   │   ├── useAgora.js            # Agora RTC; supervisor skips publish; _sv_ filtering
+│   │   │   └── useTranscript.js       # AudioWorklet pipeline; 10s heartbeat; 15s health check
+│   │   └── store/
+│   │       ├── useAuthStore.js        # rehydrate() sync; tryRefresh() async; hydrated flag
+│   │       ├── useMeetingStore.js     # applyMeetingStatus(); clearMeeting(); no agoraToken stored
+│   │       └── useTranscriptStore.js  # mergeCatchupData(); addSegment() deduplication
+│   ├── tailwind.config.js
+│   ├── vite.config.js
+│   └── vercel.json                    # SPA rewrite: * → /index.html
+└── server/
+    ├── src/
+    │   ├── server.ts                  # Boot sequence, service wiring, graceful shutdown
+    │   ├── config/
+    │   │   └── env.ts                 # Zod schema; exits on missing required vars
+    │   ├── auth/
+    │   │   ├── jwt.ts                 # issueInternalJwt, verifyInternalJwt, decodeExpiredJwt
+    │   │   └── supabase.ts            # verifySupabaseToken via supabaseAdmin.auth.getUser
+    │   ├── db/
+    │   │   ├── pool.ts                # pg Pool max 50; checkDbConnection()
+    │   │   └── redis.ts               # ioredis client (null if no REDIS_URL); waitForRedis; disconnectRedis
+    │   ├── domain/
+    │   │   ├── MeetingService.ts      # All meeting lifecycle methods
+    │   │   ├── meetingMachine.ts      # Pure state machine; MEETING_TRANSITIONS lookup table
+    │   │   ├── TranscriptService.ts   # unnest() batch insert; 500ms / 20-segment flush
+    │   │   ├── AgoraTokenService.ts   # deriveUid() SHA-256; generateToken()
+    │   │   ├── PresenceService.ts     # setWaiting, heartbeat, setOffline, broadcastPresenceDelta
+    │   │   ├── SessionService.ts      # Reconnect tokens; DELETE…RETURNING (atomic consume)
+    │   │   └── ClaimService.ts        # Legacy claim flow (unused in primary open-room flow)
+    │   ├── http/
+    │   │   ├── auth.ts                # /auth/session, /auth/refresh, /auth/me
+    │   │   ├── meetings.ts            # GET /meetings/:id, /transcript, /notes
+    │   │   ├── videos.ts              # POST upload-url, GET stream-url; bucket: interview-videos
+    │   │   ├── candidates.ts          # Candidate history endpoints
+    │   │   └── metrics.ts             # GET /metrics — requires supervisor/admin JWT
+    │   ├── lib/
+    │   │   ├── DeepgramManager.ts     # Live transcription; exp backoff; 160KB audio buffer
+    │   │   ├── supabase.ts            # Admin client; exits if any Supabase env var missing
+    │   │   ├── logger.ts              # pino instance
+    │   │   ├── errors.ts              # DomainError with typed code
+    │   │   └── ids.ts                 # newId() — cuid2
+    │   ├── scheduler/
+    │   │   ├── bullScheduler.ts       # BullScheduler (BullMQ) + MemoryScheduler (fallback); IScheduler interface
+    │   │   ├── recovery.ts            # Boot: only deletes expired sessions; no timer reconstruction
+    │   │   └── sweeper.ts             # startPresenceSweeper(); marks stale waiting → offline
+    │   └── socket/
+    │       ├── io.ts                  # createSocketServer(); Redis adapter conditional attach
+    │       ├── broadcast.ts           # BroadcastHelper; openRoomsUpdate() async + Redis cache
+    │       ├── rateLimiter.ts         # In-process token bucket; checkSocketRateLimit; resetSocketRateLimit
+    │       ├── middleware/
+    │       │   ├── requireJwtSocket.ts      # JWT auth; role → namespace check
+    │       │   └── attachReconnectSession.ts # Fail-soft reconnect token reader
+    │       └── namespaces/
+    │           ├── candidate.ts       # /candidate; start_session 20/min; audio_chunk 200KB/s
+    │           ├── interviewer.ts     # /interviewer; join_open_meeting, join_room, end_meeting
+    │           └── supervisor.ts      # /supervisor; subscribe_active_meetings; Redis cache 5s TTL
+    └── migrations/
+        ├── 0001_init.sql              # All enums, tables, indexes
+        ├── 0002_open_meetings.sql     # ADD VALUE 'open' to meeting_status
+        ├── 0003_open_meetings_schema.sql # interviewer_id nullable; partial unique index update
+        ├── 0004_meeting_videos.sql    # meeting_videos table; Storage setup instructions
+        └── src/migrations/
+            └── 0005_language.sql      # ALTER TABLE users ADD COLUMN language TEXT
 ```
 
 ---
 
-## 4. Authentication Flow
+## 4. Environment Variables
 
-```
-Browser                     Server                    Supabase
-   │                           │                          │
-   │── signUp/signIn ──────────────────────────────────► │
-   │◄── Supabase session (access_token) ─────────────────│
-   │                           │                          │
-   │── POST /auth/session ─────►                          │
-   │   Authorization: Bearer <supabase_access_token>      │
-   │                           │── getUser(token) ───────►│
-   │                           │◄── { id, email, role,   │
-   │                           │      name, language }    │
-   │                           │                          │
-   │                           │  UPSERT users            │
-   │                           │  (language only on INSERT│
-   │                           │   not on conflict UPDATE)│
-   │                           │                          │
-   │◄── { token, user } ───────│                          │
-   │    (internal JWT, 15m TTL)│                          │
-```
+### Server (`server/.env`)
 
-**Internal JWT payload** (`InternalJwtPayload`, `server/src/auth/jwt.ts`):
-```json
-{ "userId": "uuid", "email": "...", "role": "interviewer",
-  "orgId": null, "language": "english", "iat": 0, "exp": 0 }
-```
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `PORT` | Yes | Default 4000; Railway sets automatically |
+| `NODE_ENV` | Yes | `development` / `production` |
+| `JWT_SECRET` | Yes | Min 32 chars |
+| `CLIENT_ORIGIN` | Yes | Comma-separated allowed origins |
+| `AGORA_APP_ID` | Yes | |
+| `AGORA_APP_CERTIFICATE` | Yes | For token signing |
+| `AGORA_TOKEN_TTL_SECONDS` | No | Default 3600 |
+| `DEEPGRAM_API_KEY` | Yes | |
+| `SUPABASE_URL` | Yes | `lib/supabase.ts` exits if missing |
+| `SUPABASE_ANON_KEY` | Yes | `lib/supabase.ts` exits if missing |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes | `lib/supabase.ts` exits if missing |
+| `REDIS_URL` | **No** | Optional; falls back to in-memory if absent or timeout |
+| `GRACE_WINDOW_SECONDS` | No | Grace period after participant disconnect |
+| `CLAIM_TTL_SECONDS` | No | Claim expiry (legacy flow) |
+| `SESSION_TTL_SECONDS` | No | Reconnect token TTL |
+| `PRESENCE_SWEEPER_INTERVAL_SECONDS` | No | |
+| `PRESENCE_STALE_AFTER_SECONDS` | No | Heartbeat staleness threshold |
 
-**Token storage**: `localStorage.getItem('auth_token')` (`client/src/utils/tokenStorage.js`).
+### Client (`client/.env`)
 
-**Token refresh**: At module load, `useAuthStore.rehydrate()` runs synchronously. If the token is expired, `tryRefresh()` sends `POST /auth/refresh` with the expired token in the `Authorization` header. The server decodes it without expiry check, re-reads the user from DB (picking up current `language`), and issues a fresh 15-minute token. The grace window is 1 hour (`REFRESH_GRACE_MS = 3_600_000`).
-
-**Socket authentication** (`server/src/socket/middleware/requireJwtSocket.ts`): Reads `socket.handshake.auth.token`, calls `verifyInternalJwt()`, attaches result to `socket.data.user`. Role mismatch for the namespace → `next(new Error('AUTH_ERROR: forbidden namespace'))`.
-
-**Reconnect tokens** (`SessionService`): On every socket connect, the server issues a 256-bit URL-safe base64 token (TTL: `SESSION_TTL_SECONDS`, default 60s), persisted in `sessions` table. The client stores it in `sessionStorage` keyed by role. On reconnect, the token is sent in `socket.handshake.auth.reconnect_token` and consumed atomically via `DELETE...RETURNING` — one-shot, prevents replay.
+| Variable | Notes |
+|----------|-------|
+| `VITE_API_URL` | HTTP base URL (`http://localhost:4000` in dev) |
+| `VITE_SOCKET_URL` | Socket.IO server URL |
+| `VITE_AGORA_APP_ID` | Same Agora app as server |
 
 ---
 
-## 5. Meeting Lifecycle
+## 5. Database Schema
 
-### State machine
+PostgreSQL hosted on Supabase. Connected via `pg` pool (**max 50**, non-pooled endpoint — port 6543).
 
-```
-                              ┌─ claim_expired ─►  waiting ◄──┐
-                              │                                 │
-[open] ──interviewer_join──►[active]               [claimed]───┘
-  │                            │
-  │    [waiting]──claim──►[claimed]──candidate_join──►[connecting]──both_connected──►[active]
-  │                                                         │
-  └──end──►[ended]◄──grace_expired──[interrupted]◄──disconnect──┘
-                                        │
-                                     reconnect
-                                        │
-                                     [active]
-[waiting|claimed|connecting]──cancel──►[cancelled]
+### Enums
+
+```sql
+CREATE TYPE meeting_status AS ENUM (
+  'open', 'waiting', 'claimed', 'connecting', 'active',
+  'interrupted', 'ended', 'cancelled'
+);
+CREATE TYPE user_role AS ENUM ('candidate', 'interviewer', 'supervisor', 'admin');
 ```
 
-### Transitions and side effects
+### Core Tables
 
-| Event | From → To | Trigger | Side effects |
-|---|---|---|---|
-| `interviewer_join` | `open` → `active` | `MeetingService.onInterviewerJoin` | `Deepgram.start()`, `broadcast.meetingStatus('active')`, `broadcast.openRoomsUpdate()` |
-| `disconnect` | `connecting\|active` → `interrupted` | `MeetingService.onParticipantDisconnect` | `scheduleGraceExpiry(30s)`, `broadcast.meetingStatus('interrupted')` |
-| `reconnect` | `interrupted` → `active` | `MeetingService.onParticipantReconnect` | `scheduler.cancel(grace_expiry)`, `broadcast.meetingStatus('active')` |
-| `end` | `open\|active\|interrupted` → `ended` | `MeetingService.endMeeting` | `Deepgram.stop()`, `transcriptService.clearSeqCounter()`, `broadcast.meetingStatus('ended')`, `broadcast.openRoomsUpdate()` |
-| `grace_expired` | `interrupted` → `ended` | `JobScheduler` callback | Same as `end` |
-| `claim_expired` | `claimed` → `waiting` | `JobScheduler` callback | `presenceService.broadcastPresenceDelta()` [legacy] |
+**`users`**
+```sql
+id            UUID PRIMARY KEY
+email         TEXT UNIQUE NOT NULL
+role          user_role NOT NULL
+org_id        UUID
+language      TEXT NOT NULL DEFAULT 'english'  -- CHECK IN ('english','tamil','hindi')
+created_at    TIMESTAMPTZ
+```
 
-**Deepgram** is started twice for the same meeting in the primary flow: once in `createOpenMeeting` (so the candidate's audio is captured from the moment they join their solo room) and once in `onInterviewerJoin` (guarded by the session's `has()` check — the second call is a no-op).
+**`meetings`**
+```sql
+id              UUID PRIMARY KEY
+candidate_id    UUID REFERENCES users(id)
+interviewer_id  UUID REFERENCES users(id)  -- NULLABLE (NULL for status='open')
+org_id          UUID
+status          meeting_status NOT NULL DEFAULT 'waiting'
+language        TEXT NOT NULL DEFAULT 'english'
+room_code       TEXT UNIQUE
+started_at      TIMESTAMPTZ
+ended_at        TIMESTAMPTZ
+created_at      TIMESTAMPTZ
+```
+
+**`transcript_segments`**
+```sql
+id          UUID PRIMARY KEY
+meeting_id  UUID REFERENCES meetings(id)
+speaker     TEXT NOT NULL           -- 'candidate' | 'interviewer'
+text        TEXT NOT NULL
+start_time  NUMERIC                 -- seconds from meeting start
+end_time    NUMERIC
+confidence  NUMERIC
+created_at  TIMESTAMPTZ
+```
+
+**`notes`**
+```sql
+id            UUID PRIMARY KEY
+meeting_id    UUID REFERENCES meetings(id)
+author_id     UUID REFERENCES users(id)
+body          TEXT NOT NULL
+is_free_note  BOOLEAN DEFAULT FALSE  -- free notes visible to candidate
+created_at    TIMESTAMPTZ
+updated_at    TIMESTAMPTZ
+```
+
+**`sessions`** (reconnect tokens)
+```sql
+id          UUID PRIMARY KEY
+user_id     UUID REFERENCES users(id)
+meeting_id  UUID
+token       TEXT UNIQUE NOT NULL    -- 256-bit base64url; single-use
+expires_at  TIMESTAMPTZ
+created_at  TIMESTAMPTZ
+```
+
+**`meeting_videos`**
+```sql
+id            UUID PRIMARY KEY
+meeting_id    UUID REFERENCES meetings(id)
+storage_path  TEXT NOT NULL         -- path in 'interview-videos' Supabase Storage bucket
+uploaded_by   UUID
+uploaded_at   TIMESTAMPTZ
+```
+
+**`candidates`** (presence / queue)
+```sql
+id               UUID PRIMARY KEY   -- same as users.id
+status           TEXT               -- 'waiting' | 'offline'
+interview_count  INTEGER DEFAULT 0  -- used for FIFO ordering
+joined_queue_at  TIMESTAMPTZ
+last_heartbeat   TIMESTAMPTZ
+```
 
 ---
 
-## 6. Socket Architecture
+## 6. Meeting State Machine
 
-### `/candidate` namespace
+Defined in `server/src/domain/meetingMachine.ts` as pure transition lookup tables with no side effects.
 
-**Middleware:** `requireJwtSocket(role='candidate')` → `attachReconnectSession`
+### Status flow
 
-**`socket.data` shape:**
+```
+open ──── interviewer joins open room ─────────────────► active
+waiting ── interviewer joins ──────────────────────────► connecting
+connecting ─ Agora handshake done ─────────────────────► active
+active ──── participant disconnects ───────────────────► interrupted
+interrupted ─ grace expires, no rejoin ────────────────► ended
+interrupted ─ participant reconnects ──────────────────► active (or connecting)
+active / connecting ─ end_meeting ─────────────────────► ended
+open / waiting / claimed ─ cancel ─────────────────────► cancelled
+```
+
+### State table
+
+| Status | Who's present | Notes |
+|--------|---------------|-------|
+| `open` | Candidate only | Created by candidate; `interviewer_id = NULL` |
+| `waiting` | Candidate only | Legacy claim flow |
+| `claimed` | Claim placed, not yet joined | Legacy flow only |
+| `connecting` | Both in Agora, handshake in progress | |
+| `active` | Full session; Deepgram live | |
+| `interrupted` | One side disconnected; grace window open | BullMQ job scheduled |
+| `ended` | Permanently finished | Transcript flushed to DB |
+| `cancelled` | Never started | |
+
+`guardMeetingTransition()` and `guardCandidateTransition()` throw `InvalidTransitionError` on illegal transitions.
+
+---
+
+## 7. Redis Architecture
+
+Redis is **optional**. At boot, `waitForRedis(5000)` probes connectivity with a 5-second timeout. On failure or absence, `disconnectRedis()` closes the ioredis connection permanently (stops reconnect log spam), and the system falls back to in-memory alternatives.
+
+### Redis client (`server/src/db/redis.ts`)
+
 ```ts
-{ user: InternalJwtPayload & {exp,iat}, meetingId?: string,
-  meetingStatus?: MeetingStatus, session?: SessionRecord }
+export const redis: Redis | null = env.REDIS_URL
+  ? new Redis(env.REDIS_URL, { maxRetriesPerRequest: 3, enableReadyCheck: true, ... })
+  : null;
 ```
 
-| Event (client→server) | Rate limit | Handler |
-|---|---|---|
-| `start_session` | 5/60s | Creates open meeting, emits `meeting_attached` |
-| `heartbeat` | 1/8s | No-op (legacy keepalive) |
-| `audio_chunk` (Buffer) | inline byte-rate | Forward to `DeepgramManager.send()` if status is active/open |
-| `add_note` | 30/60s | `TranscriptService.addNote`, `broadcast.noteAdded` |
-| `update_note` | 30/60s | Author check, `TranscriptService.updateNote` |
-| `delete_note` | 30/60s | Author check, `TranscriptService.deleteNote` |
-| `share_video` | 10/60s | Supabase Storage signed URL → `video_available` to all namespaces |
-| `video_play/pause/seek` | 60/60s | Sync to `meeting:${id}` room on all namespaces |
+`redis` is `null` when `REDIS_URL` is not set. All consumers null-check before use.
 
-**Server→client events:** `session_established`, `session_replaced`, `socket_error`, `meeting_attached`, `meeting_status`, `transcript_segment`, `transcript_error`, `note_added`, `note_updated`, `note_deleted`, `video_available`, `video_play_sync`, `video_pause_sync`, `video_seek_sync`
+### Redis usage
 
-**audio_chunk guard** (`candidate.ts:218`): Skips if `meetingStatus !== 'active' && meetingStatus !== 'open'`, or not in `meeting:${id}` room, or chunk size outside 1–32768 bytes. Inline byte-rate limit: 200KB/second window.
+| Use | Key pattern | TTL | Notes |
+|-----|------------|-----|-------|
+| Socket.IO adapter | (internal pub/sub) | — | Cross-instance socket coordination |
+| Open rooms cache | `openrooms:{lang}` | 5s | Per-language; invalidated on room state change |
+| Active meetings cache | `activemeetings:{lang}` | 5s | Supervisor dashboard |
+| BullMQ job store | `bull:meeting-jobs:*` | Job TTL | Grace/claim expiry timers; survive restarts |
 
----
+### Redis adapter (`server/src/socket/io.ts`)
 
-### `/interviewer` namespace
-
-**Middleware:** `requireJwtSocket(role='interviewer')` → `attachReconnectSession`
-
-**`socket.data` shape:**
 ```ts
-{ user: InternalJwtPayload & {exp,iat}, meetingId?: string, session?: SessionRecord }
+if (options.redisAvailable && redis) {
+  const pubClient = redis.duplicate();
+  const subClient = redis.duplicate();
+  io.adapter(createAdapter(pubClient, subClient));
+}
 ```
 
-| Event (client→server) | Rate limit | Handler |
-|---|---|---|
-| `subscribe_open_rooms` | 20/60s | Join `open_rooms_monitor` room; return language-filtered list |
-| `join_open_meeting` | 10/60s | Language pre-flight query → `MeetingService.onInterviewerJoin` → Agora token → broadcasts |
-| `join_room` | 20/60s | Legacy reconnect path for active/interrupted meetings |
-| `end_meeting` | 10/60s | Owner check → `MeetingService.endMeeting` → broadcasts |
-| `add_note` | 30/60s | Owner check → `TranscriptService.addNote` |
-| `update_note` / `delete_note` | 30/60s | Author check |
-| `share_video` | 10/60s | Signed URL generation → `video_available` broadcast |
-| `video_play/pause/seek` | 60/60s | Sync to meeting room |
-
-**Server→client events:** All shared events + `open_rooms_update`, `candidate_queue_update` (legacy)
-
-All listeners are registered **before** the `await resumeOrAttachCurrentMeeting()` call (`interviewer.ts:401`) so no events are silently dropped during async reconnect initialization.
+Two dedicated connections (pub + sub) duplicated from the main `redis` client. Without Redis, Socket.IO uses its default in-memory adapter.
 
 ---
 
-### `/supervisor` namespace
+## 8. Job Scheduler (BullMQ / MemoryScheduler)
 
-**Middleware:** `requireJwtSocket(role='supervisor')` → `attachReconnectSession`
+Defined in `server/src/scheduler/bullScheduler.ts`. Both implementations satisfy the `IScheduler` interface.
 
-**`socket.data` shape:**
+### `IScheduler`
+
 ```ts
-{ user: InternalJwtPayload & {exp,iat}, session?: SessionRecord }
+interface IScheduler {
+  registerHandler(jobName: string, handler: (data: unknown) => Promise<void>): void;
+  schedule(jobName: string, data: unknown, delayMs: number, jobId?: string): Promise<void>;
+  cancel(jobId: string): Promise<void>;
+  start(): void;
+  close(): Promise<void>;
+  getQueueDepth(): Promise<number>;
+}
 ```
-No `meetingId` — supervisors do not own meetings.
 
-| Event (client→server) | Rate limit | Handler |
-|---|---|---|
-| `subscribe_active_meetings` | 20/60s | Join `meetings_monitor` room; return language-filtered list |
-| `join_room` | 30/60s | Subscriber Agora token (RtcRole.SUBSCRIBER), return segments+notes |
+### `BullScheduler` (Redis available)
 
-**Server→client events:** All staff shared events + `meeting_status` (from `meeting:{id}` room AND `meetings_monitor` room, deduplicated by Socket.IO).
+- BullMQ `Queue` + `Worker` on queue `meeting-jobs`
+- Deterministic job IDs prevent duplicate scheduling on reconnect
+- Jobs persist in Redis across server restarts — grace timers survive crashes
+- Handlers: `grace_expiry` → `meetingService.onGraceExpired()`, `claim_expiry` → `claimService.onClaimExpired()`
 
-Supervisors' Agora UIDs are **not** prefixed `_sv_` in the new flow. They use `AgoraTokenService.deriveUid()` like everyone else but receive SUBSCRIBER tokens, so they never publish tracks and never appear in remote users' `user-published` events.
+### `MemoryScheduler` (Redis unavailable)
+
+- In-process `setTimeout` calls stored in `Map<string, ReturnType<typeof setTimeout>>`
+- Jobs lost on server restart — boot-time settle scan partially compensates
+
+### Boot wiring
+
+```ts
+const scheduler = redisAvailable ? new BullScheduler() : new MemoryScheduler();
+scheduler.registerHandler('grace_expiry', ...);
+scheduler.registerHandler('claim_expiry', ...);
+scheduler.start();  // starts BullMQ worker; no-op for MemoryScheduler
+```
+
+### Recovery (`server/src/scheduler/recovery.ts`)
+
+`recoverScheduledJobs()` runs at boot and **only** deletes expired sessions from the `sessions` table. It does **not** reconstruct timers — BullMQ persists those in Redis automatically.
 
 ---
 
-## 7. Real-time Data Flow
+## 9. Socket.IO Architecture
 
-### Flow A: Candidate starts session → appears on interviewer dashboard
+Three namespaces on one HTTP server, created in `server/src/socket/io.ts`.
 
-```
-Candidate browser                Server                  Interviewer browser
-      │                             │                           │
-      │─ socket.emit('start_session')►                          │
-      │                     createOpenMeeting()                 │
-      │                     (INSERT meetings status='open')     │
-      │                     DeepgramManager.start()             │
-      │◄─ meeting_attached ─────────│                           │
-      │   (meetingId, agoraChannel, │                           │
-      │    agoraToken, uid)         │                           │
-      │                     broadcast.openRoomsUpdate()         │
-      │                     [fetch sockets in open_rooms_monitor│
-      │                      query DB per socket language]      │
-      │                             │── open_rooms_update ─────►│
-      │                             │   { meetings: [...] }     │
-      │                             │                    setOpenRooms(meetings)
-```
+### Namespaces
 
-### Flow B: Interviewer joins → both enter InterviewRoom
+| Namespace | Auth | Rate limits | Purpose |
+|-----------|------|------------|---------|
+| `/candidate` | None (room code is credential) | `start_session`: **20/min**; `audio_chunk`: 200 KB/s | Session start, audio, notes, video sync |
+| `/interviewer` | JWT required (`role: interviewer`) | None | Join/end meetings, notes, video |
+| `/supervisor` | JWT required (`role: supervisor`) | None | Monitor meetings (stealth) |
 
-```
-Interviewer                      Server                       Candidate
-      │                             │                             │
-      │─ join_open_meeting ─────────►                             │
-      │  { meetingId }              │                             │
-      │                    [language pre-flight query]            │
-      │                    MeetingService.onInterviewerJoin()     │
-      │                    (UPDATE meetings SET status='active')  │
-      │                    DeepgramManager.start() [no-op]       │
-      │                             │── meeting_status('active')►│
-      │                             │   { interviewerName,        │
-      │                             │     participantUids }       │
-      │◄─ meeting_attached ─────────│                             │
-      │   (agoraToken, uid)         │── open_rooms_update ───────►│ (other interviewers)
-      │                             │                             │
-      │  client.join(channel)       │                    client.join(channel)
-      │  publish audio+video        │                    publish audio+video
-```
+### Socket rooms
 
-### Flow C: Candidate speaks → transcript appears
+| Room | Members | Events |
+|------|---------|--------|
+| `meeting:{meetingId}` | Candidate + interviewer + supervisors | All scoped meeting events |
+| `open_rooms_monitor` | Interviewers on dashboard | `open_rooms_update` |
+| `meetings_monitor` | Subscribed supervisors | `meeting_status` on any change |
 
-```
-Candidate mic → AgoraRTC.createMicrophoneAudioTrack()
-             → getMediaStreamTrack()
-             → AudioContext(16kHz) + AudioWorklet('/audio-processor.js')
-             → PCM Int16 chunks
-             → socket.emit('audio_chunk', buffer)  [candidate→/candidate]
-             → Server: DeepgramManager.send(meetingId, chunk)
-             → Deepgram WebSocket (linear16, 16kHz, nova-2)
-             → Deepgram fires Transcript event (is_final=true)
-             → TranscriptService.appendSegment() → INSERT transcript_segments
-             → onSegment callback → BroadcastHelper.transcriptSegment()
-             → Socket.IO: emit 'transcript_segment' to meeting:{id}
-                on /interviewer, /candidate, /supervisor namespaces
-             → Client: useTranscriptStore.addSegment(segment)
-             → TranscriptBox re-renders
-```
+### Middleware
 
-### Flow D: Interviewer edits transcript
+**`requireJwtSocket.ts`** — Reads `handshake.auth.token`, verifies internal JWT, checks role matches namespace. Emits `AUTH_ERROR: forbidden namespace` and disconnects on mismatch.
 
-```
-Interviewer clicks segment text → contentEditable blur
-→ socket.emit('add_note', { meetingId, body, anchorSegmentId: segment.id })
-→ Server: TranscriptService.addNote() → INSERT transcript_notes
-→ broadcast.noteAdded() → 'note_added' to meeting:{id} on all namespaces
-→ Client: useTranscriptStore.addNote(note)
-→ TranscriptBox: notesBySegmentId[seg.id] now has a note
-→ EditableSegment displays note.body instead of segment.text (underlined)
-```
+**`attachReconnectSession.ts`** — Reads `handshake.auth.reconnect_token`. Fail-soft — never rejects connection. On failure, `socket.data.reconnectSession` is `undefined`.
 
-### Flow E: Meeting ends → both navigate away
+### Events — `/candidate`
 
-```
-Interviewer: socket.emit('end_meeting', { meetingId, reason })
-→ Server: MeetingService.endMeeting()
-  → UPDATE meetings SET status='ended'
-  → UPDATE candidate_presence SET status='offline'
-  → Deepgram.stop(meetingId)
-  → transcriptService.clearSeqCounter(meetingId)
-  → broadcast.meetingStatus(meetingId, 'ended')
-  → broadcast.openRoomsUpdate()
-→ All clients receive 'meeting_status' { status: 'ended' }
-→ useMeetingStore.applyMeetingStatus({ status: 'ended' })
-→ InterviewRoom shows terminated overlay + 5-second countdown
-→ clearMeeting() + clearTranscript() → navigate('/interviewer' | '/candidate')
-History stored: transcript_segments and transcript_notes remain in DB,
-queryable via GET /candidates/:id/history/:meetingId/transcript
-```
+| Direction | Event | Notes |
+|-----------|-------|-------|
+| → server | `start_session` | Rate-limited **20/min**. Creates/resumes meeting; returns Agora token + meeting data |
+| → server | `audio_chunk` | Raw PCM bytes → Deepgram. 200 KB/s limit. Gated by `socket.data.meetingStatus` cache |
+| → server | `candidate_heartbeat` | 10s interval; updates `candidates.last_heartbeat` |
+| → server | `add_note`, `update_note`, `delete_note` | Notes CRUD |
+| → server | `share_video`, `video_play`, `video_pause`, `video_seek` | Video resume sync |
+| → client | `session_established` | Reconnect token + meeting data |
+| → client | `meeting_attached` | Meeting found via reconnect token |
+| → client | `meeting_status` | Status change |
+| → client | `transcript_segment` | Real-time Deepgram segment |
+| → client | `session_replaced` | Another session opened → logout |
+
+### Events — `/interviewer`
+
+| Direction | Event | Notes |
+|-----------|-------|-------|
+| → server | `subscribe_open_rooms` | Join `open_rooms_monitor` room |
+| → server | `join_open_meeting` | Join an open room; language pre-flight check |
+| → server | `join_room` | Legacy reconnect path |
+| → server | `end_meeting` | End meeting; triggers transcript flush |
+| → server | `add_note`, `update_note`, `delete_note` | Notes CRUD |
+| → server | `share_video`, `video_play`, `video_pause`, `video_seek` | Video sync |
+
+### Events — `/supervisor`
+
+| Direction | Event | Notes |
+|-----------|-------|-------|
+| → server | `subscribe_active_meetings` | Returns language-filtered active meetings; Redis cache 5s TTL |
+| → server | `join_room` | Language pre-flight; `FORBIDDEN` on mismatch |
+
+Supervisor Agora UIDs are prefixed `_sv_` (set in `namespaces/interviewer.ts`) and filtered from `remoteUsers` in `useAgora.js`. `socketId` fields are stripped from meeting data before broadcast.
+
+### `BroadcastHelper` (`server/src/socket/broadcast.ts`)
+
+Centralises all server→client emits.
+
+**`openRoomsUpdate()`** (async):
+1. Invalidates `openrooms:*` Redis keys
+2. `fetchSockets()` with 3-second `Promise.race` timeout (guards against Redis adapter hang)
+3. Per socket: reads `socket.data.user.language`, checks Redis cache `openrooms:{lang}` (5s TTL), fetches from DB on miss, emits `open_rooms_update`
+
+**`meetingStatus()`**: Invalidates `activemeetings:*` Redis keys before emitting to meeting room and `meetings_monitor`.
 
 ---
 
-## 8. HTTP API
+## 10. HTTP API
 
-All routes use `Bearer <internal_JWT>` unless noted. Error shape: `{ error: string, code: string }`.
+### Auth (`/auth`)
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| `POST` | `/auth/session` | Supabase JWT | Exchange Supabase token for internal JWT |
-| `POST` | `/auth/refresh` | Expired internal JWT | Reissue within 1-hour grace window |
-| `GET` | `/auth/me` | Internal JWT | Return `req.user` (decoded JWT payload) |
-| `GET` | `/meetings/:id` | JWT + `canViewMeeting` | Meeting details + computed Agora UIDs |
-| `GET` | `/meetings/:id/transcript` | JWT + `canViewMeeting` | Segments, `afterSeq` cursor, `limit` (max 500) |
-| `GET` | `/meetings/:id/notes` | JWT + `canViewMeeting` | Notes, optional `updatedAfter` ISO filter |
-| `POST` | `/meetings/:id/videos/upload-url` | JWT + `canViewMeeting` | Supabase Storage signed upload URL + `storagePath` |
-| `POST` | `/meetings/:id/videos` | JWT + `canViewMeeting` | Save video metadata → returns `{ videoId }` |
-| `GET` | `/meetings/:id/videos/:videoId/stream-url` | JWT + `canViewMeeting` | 1-hour signed read URL |
-| `GET` | `/candidates/:id/history` | JWT + `canViewCandidateHistory` | List ended meetings (summary rows) |
-| `GET` | `/candidates/:id/history/:mid/transcript` | JWT + `canViewCandidateHistory` | All segments (up to 5000) |
-| `GET` | `/candidates/:id/history/:mid/notes` | JWT + `canViewCandidateHistory` | All notes |
-| `GET` | `/metrics` | **None** (TODO: add auth) | Active meetings, queue depth, scheduled jobs, Deepgram sessions |
-| `GET` | `/health` | None | `{ status, version, nodeEnv, uptime }` |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/auth/session` | None | Supabase token → internal JWT |
+| POST | `/auth/refresh` | Expired JWT (1h grace) | Refresh internal JWT |
+| GET | `/auth/me` | JWT | Current user payload |
 
-**Video upload body** (`POST /meetings/:id/videos/upload-url`): `{ filename: string, contentType: "video/mp4"|"video/webm"|"video/quicktime" }`. Storage path format: `{meetingId}/{uuid}-{sanitized_filename}`.
+### Meetings (`/meetings`)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/meetings/:id` | JWT | Meeting detail |
+| GET | `/meetings/:id/transcript` | JWT | Full transcript segments |
+| GET | `/meetings/:id/notes` | JWT | Meeting notes |
+| POST | `/meetings/:id/videos/upload-url` | JWT | Supabase Storage signed upload URL |
+| GET | `/meetings/:id/videos` | JWT | List meeting videos |
+| GET | `/meetings/:id/stream-url` | JWT | Signed stream URL |
+
+### Candidates (`/candidates`)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/candidates/:id/history` | JWT | Past meetings for candidate |
+
+### Metrics (`/metrics`)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/metrics` | JWT — **supervisor or admin role required** | `{ activeMeetings, queueDepth, scheduledJobs, deepgramSessions }` |
+
+### Health
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/health` | None | `{ status, version, nodeEnv, uptime }` — excluded from pino access logging |
 
 ---
 
-## 9. Client Architecture
+## 11. Authentication
 
-### Pages
+### Login
 
-| Page | Route | Role | Socket namespace |
-|---|---|---|---|
-| `LoginPage` | `/` | Any | None |
-| `RegisterPage` | `/register` | Any | None |
-| `CandidateWaitingRoom` | `/candidate` | candidate | `/candidate` |
-| `InterviewerDashboard` | `/interviewer` | interviewer | `/interviewer` |
-| `SupervisorDashboard` | `/supervisor` | supervisor | `/supervisor` |
-| `InterviewRoom` | `/room/:roomId` | all roles | `/candidate`, `/interviewer`, or `/supervisor` |
+```
+Client → POST /auth/session { supabase_token }
+       → verifySupabaseToken() via supabaseAdmin.auth.getUser()
+       → reads role + language from user_metadata
+       → issueInternalJwt({ userId, email, role, orgId, language }, 15m TTL)
+       → { token, user }
+```
 
-`App.jsx` uses `AppInit` to gate rendering until `useAuthStore.hydrated` is true. `ProtectedRoute` enforces role. `RoomGuard` allows authenticated users OR anyone with a matching `roomId` in `useRoomStore` (legacy path; current flow uses JWT auth for all).
+### Token refresh
+
+```
+Client → POST /auth/refresh { token: expiredJwt }
+       → decodeExpiredJwt() (ignoreExpiration: true)
+       → verify within 1h grace window
+       → issue new JWT (15m TTL)
+```
+
+### Socket auth
+
+`handshake.auth.token` → `requireJwtSocket.ts` → `verifyInternalJwt()` → role-to-namespace check.
+
+### Reconnect tokens
+
+256-bit base64url, stored in `sessions` table. `SessionService.findByToken()` uses `DELETE…RETURNING` for atomic single-use consumption. A fresh token is issued on each `session_established`.
 
 ---
+
+## 12. Deepgram Transcription Pipeline
+
+**Path**: candidate mic → `pcm-processor` AudioWorklet → Int16 PCM → `audio_chunk` Socket.IO event → `DeepgramManager` → Deepgram Nova-2 WebSocket → `TranscriptService.appendSegment()` → broadcast `transcript_segment` to all 3 namespaces + async batch DB write.
+
+**Audio format**: linear16 PCM, 16 kHz, mono.
+
+**`DeepgramManager`** (`server/src/lib/DeepgramManager.ts`):
+- `MAX_RETRIES = 3`; exponential backoff 500ms / 1s / 2s
+- `MAX_BUFFERED_AUDIO_BYTES = 160_000` — queues incoming audio during reconnect
+- Gap segment inserted after reconnect to mark the interruption
+- `onFatalError` callback → `BroadcastHelper.transcriptError(meetingId)`
+
+**`TranscriptService`** (`server/src/domain/TranscriptService.ts`):
+- `BATCH_SIZE = 20`, `FLUSH_INTERVAL_MS = 500`
+- Segments buffered in `Map<meetingId, BufferedSegment[]>`
+- `insertBatch()` uses PostgreSQL `unnest()` for a single round-trip batch insert
+- `appendSegment()` triggers broadcast immediately; DB write is batched asynchronously
+- `flush(meetingId?)` called at `endMeeting()` to drain remaining segments
+
+---
+
+## 13. Agora RTC
+
+**Token generation** (`server/src/domain/AgoraTokenService.ts`):
+- `deriveUid(meetingId, userId)`: SHA-256 → first 4 bytes → `>>> 1 | 1` → 31-bit positive int
+- `generateToken()`: `RtcRole.PUBLISHER` for interviewer/candidate; `RtcRole.SUBSCRIBER` for supervisor
+
+**Client hook** (`client/src/hooks/useAgora.js`):
+- Supervisors skip track creation and publish
+- Remote users: UIDs prefixed `_sv_` are filtered out of `remoteUsers`
+- `AudioContext.resume()` on `visibilitychange` and `focus` events (mobile/tab sleep)
+- `startTransition` wraps `setRemoteUsers` to avoid tearing
+- `mountedRef` guards prevent state updates after unmount
+
+Supervisor UID prefix `_sv_` is set in `namespaces/interviewer.ts`. Never change without updating both `AgoraTokenService.ts` and `useAgora.js`.
+
+---
+
+## 14. Client Architecture
+
+### Routing (`App.jsx`)
+
+```
+/              → redirect based on role
+/login         → LoginPage (public)
+/register      → RegisterPage (public)
+/join/:code    → CandidateJoinPage → CandidateWaitingRoom
+/interviewer   → ProtectedRoute(role: interviewer) → InterviewerDashboard
+/supervisor    → ProtectedRoute(role: supervisor) → SupervisorDashboard
+/room/:id      → RoomGuard → InterviewRoom
+```
+
+`AppInit` gates rendering on `hydrated` from `useAuthStore`. Sync `rehydrate()` at module load; async `tryRefresh()` after.
 
 ### Zustand stores
 
-#### `useAuthStore` (`client/src/store/useAuthStore.js`)
-| Field | Type | Notes |
-|---|---|---|
-| `user` | `{ userId, email, role, name, language }` \| null | null until authenticated |
-| `token` | string \| null | Internal JWT |
-| `isAuthenticated` | boolean | |
-| `hydrated` | boolean | false until rehydrate/tryRefresh settles |
+**`useAuthStore`** — `user`, `token`, `hydrated`. `rehydrate()` is sync (sessionStorage). `tryRefresh()` is async. `userFromPayload()` reads `language` from JWT payload.
 
-Actions: `login(user, token)`, `logout()`, `rehydrate()` (sync), `tryRefresh(expiredToken)` (async). The `userFromPayload()` helper reads `language ?? null` from the JWT. Module-level self-hydration runs at import time before any React render.
+**`useMeetingStore`** — All meeting fields. `applyMeetingStatus()` handles transitions. `clearMeeting()` on end. Agora token intentionally **not** stored.
 
-#### `useMeetingStore` (`client/src/store/useMeetingStore.js`)
-| Field | Type | Notes |
-|---|---|---|
-| `meetingId` | UUID \| null | |
-| `agoraChannel` | string \| null | |
-| `agoraUid` | number \| null | Server-assigned |
-| `candidateId` / `interviewerId` | UUID \| null | |
-| `candidateName` / `interviewerName` | string \| null | |
-| `candidateAgoraUid` / `interviewerAgoraUid` | number \| null | SHA-256 derived |
-| `status` | meeting status string | mirrors server enum + `idle` |
+**`useTranscriptStore`** — `mergeCatchupData()` map-merge by ID + sort. `addSegment()` deduplicates by ID.
 
-Actions: `setWaiting()`, `setMeetingJoined({...})`, `applyMeetingStatus({meetingId, status})`, `setParticipantNames({...})`, `clearMeeting()`. `agoraToken` is intentionally never stored here — passed directly to `joinChannel()`.
+### Socket singletons (`useSocket.js`)
 
-#### `useTranscriptStore` (`client/src/store/useTranscriptStore.js`)
-| Field | Type | Notes |
-|---|---|---|
-| `segments` | `SegmentRow[]` | Ordered by `seq`; finals only |
-| `interimSegment` | `{ text }` \| null | Live partial, not persisted |
-| `notes` | `NoteRow[]` | Ordered by `createdAt` |
-| `transcriptionFailed` | boolean | |
+Module-level singleton socket instances per namespace. `reconnectStorage` and `attachedMeetingStorage` in sessionStorage. `session_established` stores new reconnect token. `session_replaced` → logout + `disconnectAll()`.
 
-Actions: `addSegment(segment)` (deduplicates by id), `setInterimSegment(partial)`, `setInitialData({segments, notes})`, `mergeCatchupData({segments, notes})` (merge-by-id + sort), `addNote/updateNote/removeNote`, `setTranscriptionFailed(bool)`, `clearTranscript()`.
+### InterviewRoom layout
+
+```
+┌──────────────────────────────────────────┐
+│  Header (logo, meeting ID, status badge) │  ~56px fixed
+├──────────────────────┬───────────────────┤
+│  Video area          │  Sidebar           │
+│  flex-[3]  (60%)     │  flex-[2]  (40%)  │
+│  VideoGrid           │  Tab strip         │
+│  ParticipantPanel    │  [T | N | V | H]   │
+│                      │  PanelContent      │
+├──────────────────────┴───────────────────┤
+│  RoomControls (mic, camera, end call)    │  ~64px fixed
+└──────────────────────────────────────────┘
+```
+
+Mobile (below `md`): stacked — video (aspect-video) → panel → combined controls+tabs bar at bottom.
+
+Overlays:
+- **Interrupted**: 30s countdown + reconnect prompt
+- **Terminated**: 5s draining dot row → auto-redirect
 
 ---
 
-### Hooks
+## 15. Design System
 
-**`useAgora`** (`client/src/hooks/useAgora.js`): Manages the Agora RTC client lifecycle. Creates `AgoraRTC.createClient({mode:'rtc', codec:'vp8'})` on `joinChannel()`. Supervisors join as subscriber-only (no audio/video tracks created). Exposes `localVideoRef`, `localAudioTrack`, `remoteUsers`, `joinChannel`, `leaveChannel`, `toggleMute`, `toggleCamera`. Uses `startTransition` for `setRemoteUsers` updates to avoid concurrent-render issues. `mountedRef` guards all async operations against stale updates after unmount.
+### Color tokens (`client/tailwind.config.js`)
 
-**`useTranscript`** (`client/src/hooks/useTranscript.js`): Manages the audio pipeline for candidates. `localAudioTrack.getMediaStreamTrack()` → `AudioContext(16kHz)` → `AudioWorklet('/audio-processor.js')` → `socket.emit('audio_chunk', buffer)`. Skips if `pausedRef.current` is true (muted). Health-check timer logs pipeline state every 15 seconds. Heartbeat timer fires `socket.emit('heartbeat')` every 10 seconds independently of the audio pipeline.
+The primary palette was switched from indigo (#6366f1) to **teal** (#14b8a6) and surface from slate to **zinc** in the redesign. All existing `primary-*` and `surface-*` class references pick up the new values automatically — no JSX renaming required.
 
-**`useSocket`** (`client/src/hooks/useSocket.js`): Module-level singleton map `{ interviewer, candidate, supervisor }`. `getSocket(role)` creates the socket once; subsequent calls return the same instance. Stores reconnect tokens in `sessionStorage` keyed by role. Persists `meeting_attached` payloads in `sessionStorage` so navigation away and back can reattach. On `session_replaced`, logs out and disconnects all.
+| Token | Value | Use |
+|-------|-------|-----|
+| `primary-400` | `#2dd4bf` (teal) | Icons, tab active border, dot-pulse |
+| `primary-500` | `#14b8a6` (teal) | Primary interactive colour |
+| `primary-600` | `#0d9488` (teal) | Button background (`btn-primary`) |
+| `surface-950` | `#09090b` (zinc) | Page background |
+| `surface-900` | `#18181b` (zinc) | Input backgrounds |
+| `surface-800` | `#27272a` (zinc) | Card backgrounds |
+| `surface-700` | `#3f3f46` (zinc) | Borders |
+| `success-400` | `#34d399` (emerald) | Connected / active state |
+| `danger-500` | `#f43f5e` (rose) | End call, errors |
+| `warning-400` | `#fbbf24` (amber) | Interrupted / waiting states only |
 
-**`useVideoResume`** (`client/src/hooks/useVideoResume.js`): Manages Flow A (file upload) and Flow B (live recording). Upload: `POST /meetings/:id/videos/upload-url` → PUT directly to Supabase Storage via signed URL → `POST /meetings/:id/videos`. Recording (interviewer only): `MediaRecorder` on candidate's `RemoteAudioTrack + RemoteVideoTrack` → chunks → Blob → same upload path. Synchronized playback via `video_play_sync/video_pause_sync/video_seek_sync` events. `syncingRef` prevents feedback loops when applying remote sync.
+### Component classes (`client/src/index.css`)
 
----
+| Class | Description |
+|-------|-------------|
+| `.glass-card` | `bg-surface-800/60 border border-surface-700/50 rounded-lg` — **no** backdrop-blur |
+| `.glass-card-hover` | `.glass-card` + hover border brightens; no glow shadow |
+| `.glass-input` | `bg-surface-900/80 border rounded-md` — focus: `border-primary-500`; no blurred ring |
+| `.btn-primary` | Flat teal `bg-primary-600` — **no gradient, no glow, no active:scale** |
+| `.btn-secondary` | `bg-surface-800 border` — flat solid |
+| `.btn-danger` | Flat rose `bg-danger-500` — no gradient |
+| `.btn-icon` | 44px, `bg-surface-800/80 rounded-md` |
+| `.status-badge` | `rounded text-xs font-medium` — `rounded` (2px) not `rounded-full` |
+| `.video-tile-label` | **Keeps** `backdrop-blur-sm` — sits over live video where blur is real |
+| `.dot-pulse` | Three-dot bounce using `primary-400` |
+| `.room-code` | `font-mono text-4xl tracking-[0.3em] text-primary-400` |
+| `.toast` variants | `animate-slide-in-right` fixed toasts |
 
-### `InterviewRoom` component tree
+**Font**: Geist loaded via `@fontsource/geist` npm package (weights 300–800; no CDN request). JetBrains Mono for mono elements.
 
-```
-InterviewRoom (page — manages socket events, useAgora, useTranscript)
-├── ConnectionLostBanner (conditional)
-├── <header> (logo, connection dot, role badge, language badge, meeting ID)
-│
-├── [mobile: isMobile=true]
-│   ├── <div.aspect-video.flex-shrink-0>
-│   │   └── VideoGrid (PiP layout: remote full, local draggable overlay)
-│   ├── <div.flex-1.min-h-0.overflow-hidden>   ← panel content wrapper
-│   │   └── PanelContent (module-level component, stable identity)
-│   │       ├── TranscriptBox        [activeTab='transcript']
-│   │       ├── NotesPanel           [activeTab='notes', supervisor only]
-│   │       ├── VideoResumePanel     [activeTab='video']
-│   │       └── <div.hidden | h-full.overflow-hidden>
-│   │           └── HistoryPanel     [mounted after first open, display:none when inactive]
-│   └── bottom bar (mic/cam | tab icons | end call)
-│
-└── [desktop: isMobile=false]
-    ├── <div.flex-[3]> left column
-    │   ├── <div.flex-1.min-h-0> VideoGrid
-    │   └── ParticipantPanel (collapsible on mobile)
-    ├── <div.flex-[2]> right sidebar
-    │   ├── tab bar (Transcript / Notes / Video / History)
-    │   └── PanelContent (same component as mobile)
-    ├── RoomControls (footer — mute, camera, end call)
-    ├── interrupted overlay (fixed, z-40)
-    └── terminated overlay (fixed, z-50, 5-second countdown)
-```
-
-`PanelContent` is defined **outside** `InterviewRoom` to prevent re-creation on every render (which would reset `HistoryPanel` scroll position). `HistoryPanel` stays mounted after first open (`historyOpened` flag), hidden via `display:none` (`hidden` class) rather than unmounting.
+**Tabular numbers**: `.font-mono` sets `font-feature-settings: "tnum" 1, "zero" 1` — timers and segment counts don't shift layout as digits change.
 
 ---
 
-## 10. Agora Integration
+## 16. Design Decisions
 
-**UID derivation** (`server/src/domain/AgoraTokenService.ts:31`):
-```ts
-SHA-256(`${meetingId}:${userId}`) → readUInt32BE(0) >>> 1 || 1
-```
-First 4 bytes of the hash, sign bit cleared (31-bit positive integer), never 0 (Agora treats 0 as "any user"). Deterministic: same meeting+user → same UID always, allowing token reissue on reconnect without a DB lookup.
+### 1. Redis is optional; dual-mode scheduler
 
-**Token generation**: `RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, channel, uid, role, expireAt)`. Interviewers and candidates → `RtcRole.PUBLISHER`. Supervisors → `RtcRole.SUBSCRIBER`. TTL: `AGORA_TOKEN_TTL_SECONDS` (default 3600s). Tokens are issued server-side only, never client-derived.
+At boot, `waitForRedis(5000)` probes Redis. On failure, `disconnectRedis()` permanently closes the ioredis connection (stops log spam), and the system falls back to `MemoryScheduler` + Socket.IO in-memory adapter.
 
-**PiP layout** (`VideoGrid.jsx`): For interviewer/candidate, the remote user's video fills the container absolutely (`RemoteTile`). The local video is a draggable overlay (`PipTile`): desktop 160×120px, mobile 96×72px, locked to bottom-right. Drag uses `window.addEventListener('mousemove')` on `onMouseDown`, clamped to container bounds. Mobile drag is disabled.
+**Tradeoff**: Without Redis, `fetchSockets()` is local-only, rate limiter buckets are per-process, and timer state is lost on restart. Multi-instance deployments require Redis.
 
-**Supervisor view** (`VideoGrid.jsx:226`): Side-by-side `VideoTile` components. Supervisors never appear as `remoteUsers` on other clients because they never publish tracks.
+### 2. BullMQ for grace/claim timers
 
-**AudioContext resume**: `useAgora` listens to `document.visibilitychange` and `window.focus` to call `AgoraRTC.getAudioContext().resume()` — browsers auto-suspend AudioContext on tab switch.
+`BullScheduler` stores grace and claim timers in Redis with deterministic job IDs. A server crash during a grace window still fires the timer after restart.
 
----
+**Tradeoff**: Crash-resilient timers depend on Redis. `MemoryScheduler` is safe for dev/staging — jobs lost on restart, settle scan partially compensates.
 
-## 11. Deepgram Integration
+### 3. `recovery.ts` — minimal boot recovery
 
-**Session lifecycle** (`server/src/lib/DeepgramManager.ts`):
-- `start(meetingId, candidateId)` — opens a WebSocket connection to Deepgram with: `model:nova-2, language:en-US, encoding:linear16, sample_rate:16000, channels:1, interim_results:true, endpointing:300`
-- `send(meetingId, chunk)` — forwards PCM chunk as `ArrayBuffer`. If not connected, buffers up to 160KB (~5s of audio)
-- `stop(meetingId)` — `requestClose()`, clears buffer, deletes session
+`recoverScheduledJobs()` **only** deletes expired sessions. It does not reconstruct timers — BullMQ persists those in Redis automatically.
 
-**Reconnect logic**: Exponential backoff — 500ms, 1000ms, 2000ms (max 8000ms), `MAX_RETRIES=3`. On reconnect success, inserts a **gap segment** (`speaker_role='system'`, text=`[transcription gap: Ns]`) to mark dead air. After 3 failed retries, calls `onFatalError` → `broadcast.transcriptError(meetingId)`.
+**Tradeoff**: In `MemoryScheduler` mode, a crash drops all timer state. Settle scan mitigates for `active` meetings only.
 
-**Audio pipeline** (client → server → Deepgram):
-```
-Agora mic track → getMediaStreamTrack()
-→ AudioContext(16kHz) + AudioWorklet('pcm-processor')
-→ Int16 PCM buffer → socket.emit('audio_chunk', buffer)
-→ candidate.ts:audio_chunk handler
-→ DeepgramManager.send(meetingId, chunk)
-→ Deepgram WebSocket.send(ArrayBuffer)
-→ Deepgram fires LiveTranscriptionEvents.Transcript
-→ if (is_final) → TranscriptService.appendSegment()
-→ onSegment callback → BroadcastHelper.transcriptSegment()
-→ socket 'transcript_segment' to all in meeting:{id}
-```
+### 4. Transcript batch insert via `unnest()`
 
-**Paused state**: `pausedRef.current` in `useTranscript` — when true (microphone muted), the `AudioWorklet.port.onmessage` handler returns early without emitting. The AudioContext is resumed on unmute.
+`TranscriptService` buffers segments and flushes every 500ms or at 20 segments using a single `unnest()` batch insert. Broadcast fires immediately, independent of the DB write.
 
-**Health check**: `setInterval(15_000)` logs `chunks`, `paused`, `socketConnected`, `trackState`, `trackEnabled`, `audioContextState` to `console.log` via `mediaLogger.js`.
+**Tradeoff**: Segments may be up to 500ms delayed in the DB (not the UI). A crash during flush loses up to 20 segments. Acceptable for interview transcription.
 
----
+### 5. In-memory room registry
 
-## 12. Video Resume Feature
+`server/src/state/roomRegistry.js` uses plain `Map`s. Durable state is the DB; in-flight state lives in socket `data`.
 
-### Flow A — Candidate/interviewer uploads a file
+**Tradeoff**: Server restart destroys in-memory state. Settle scan + BullMQ grace timers handle active meetings; open/waiting rooms with no live sockets at restart are not auto-recovered.
 
-```
-1. Client: POST /meetings/:id/videos/upload-url
-   Body: { filename, contentType }
-   Server: supabaseAdmin.storage.createSignedUploadUrl(storagePath)
-   Response: { uploadUrl, storagePath }
+### 6. Supervisor stealth via `_sv_` UID prefix
 
-2. Client: PUT {uploadUrl}  (direct to Supabase Storage, no server hop)
-   Body: file binary, Content-Type header
+Supervisor Agora UIDs are prefixed `_sv_` server-side. `useAgora.js` filters them from `remoteUsers`. Candidates never see supervisors.
 
-3. Client: POST /meetings/:id/videos
-   Body: { storagePath, type:'candidate_upload'|'interviewer_recording',
-           candidateName, interviewerName? }
-   Server: INSERT meeting_videos → returns { videoId }
+**Tradeoff**: Any refactor touching the prefix must update `AgoraTokenService.ts` and `useAgora.js` atomically.
 
-4. Client: socket.emit('share_video', { meetingId, videoId })
-   Server: SELECT storage_path FROM meeting_videos WHERE id=$1
-   Server: supabaseAdmin.storage.createSignedUrl(storage_path, 3600)
-   Server: emit 'video_available' { videoId, signedUrl, sharedBy }
-         → /interviewer, /candidate, /supervisor in meeting:{id} room
+### 7. Language separation at the query level
 
-5. All clients: useVideoResume sets sharedVideo → <video src={signedUrl}>
-```
+All room queries filter by `users.language` (migration 0005). Language flows: Supabase metadata → JWT payload → `socket.data.user.language` → every DB query and `join_room` pre-flight.
 
-### Flow B — Interviewer records live candidate video
+**Tradeoff**: Language is set at account creation and embedded in the JWT. Changing it requires re-login.
 
-```
-1. Interviewer: startRecording(remoteUsers)
-   Finds candidate by candidateAgoraUid in remoteUsers
-   candidateUser.videoTrack.getMediaStreamTrack()
-   candidateUser.audioTrack.getMediaStreamTrack()
-   new MediaStream([videoTrack, audioTrack])
-   new MediaRecorder(stream, { mimeType: 'video/webm' })
-   recorder.start(1000)  — 1s chunks
+### 8. `start_session` rate limit: 20 per minute
 
-2. Interviewer: stopRecording()
-   recorder.stop() → ondataavailable → Blob(chunks, 'video/webm')
-   → same upload flow as Flow A (type: 'interviewer_recording')
+In-process token bucket (`rateLimiter.ts`). Bucket is reset after a successful meeting end (`resetSocketRateLimit()`), so a legitimate reconnect isn't penalised.
 
-3. Synchronized playback:
-   play/pause/seek events on <video> → socket.emit('video_play|pause|seek', ...)
-   Server: re-emit to meeting room on all namespaces
-   Remote clients: onPlaySync/onPauseSync/onSeekSync set video.currentTime
-   syncingRef prevents feedback: local events suppressed while applying remote
-```
+**Tradeoff**: In-process buckets don't survive restarts and don't coordinate across instances. Acceptable for single-instance deployment.
 
-Seek events are debounced 300ms (`SEEK_DEBOUNCE_MS`) to avoid flooding on scrub.
+### 9. No React StrictMode
+
+StrictMode double-invokes effects in development. Agora RTC and Socket.IO effects are not idempotent — double-invocation joins the Agora channel twice and creates duplicate socket connections.
+
+**Tradeoff**: StrictMode's impure-render detection is unavailable.
+
+### 10. `openRoomsUpdate()` is async with per-language Redis cache
+
+`fetchSockets()` is wrapped in a 3-second `Promise.race` timeout to guard against Redis adapter slowness. Results are cached per language (5s TTL) to amortise repeated DB queries when many interviewers are on the dashboard simultaneously.
+
+**Tradeoff**: Up to 5 seconds of stale open room data per language. Acceptable — rooms are long-lived relative to the TTL.
 
 ---
 
-## 13. Language Filtering
+## 17. Deployment
 
-Language flows through every layer of the system:
+### Server — Railway
+
+- Docker: `node:22-alpine`
+- Start: `npm start` → `node --import tsx/esm src/server.ts` (`tsx` in production deps)
+- Health check: `GET /health`, timeout 30s, `ON_FAILURE` restart, max 3 retries (`server/railway.json`)
+- Env vars set in Railway dashboard; optional Redis via Railway Redis add-on (`REDIS_URL`)
+
+### Client — Vercel
+
+- Build: `npm run build:client` → `client/dist/`
+- SPA rewrite: all paths → `/index.html` (`client/vercel.json`)
+- Env vars: `VITE_*` prefix required
+
+### Boot sequence
+
+1. Zod validates env → exits on missing required vars
+2. `checkDbConnection()` — DB ping
+3. `waitForRedis(5000)` → probe; `disconnectRedis()` on failure
+4. Construct domain services; wire `broadcastRef` lazy cycle-breaker
+5. `BullScheduler` or `MemoryScheduler`; register handlers; `scheduler.start()`
+6. `recoverScheduledJobs()` — delete expired sessions only
+7. Mount HTTP routes + error handler
+8. `createSocketServer()` — Redis adapter if available; register 3 namespaces
+9. `startPresenceSweeper()`
+10. `server.listen(env.PORT)`
+11. After 10s: settle scan — any `active` meeting with no live sockets → `interrupted`
+
+### Graceful shutdown (SIGTERM / SIGINT)
 
 ```
-Registration:
-  supabase.auth.signUp({ options: { data: { language } } })
-  → user_metadata.language stored in Supabase Auth
-
-Session creation (POST /auth/session):
-  verifySupabaseToken() reads user_metadata?.language ?? 'english'
-  INSERT INTO users (..., language) ON CONFLICT DO UPDATE SET email, name
-  (language only set on INSERT — never overwritten on re-login)
-  issueInternalJwt({ ..., language: dbUser.language })
-
-Socket connection:
-  requireJwtSocket → verifyInternalJwt → socket.data.user.language
-  Fallback at every read site: socket.data.user?.language ?? 'english'
-
-Meeting filtering:
-  getOpenMeetingsWithNames(language) → WHERE u.language = $1
-  getActiveMeetingsWithNames(language) → WHERE ca.language = $1
-
-Real-time broadcast:
-  BroadcastHelper.openRoomsUpdate() → fetchSockets('open_rooms_monitor')
-  → per-socket: lang = s.data.user?.language ?? 'english'
-  → per-socket: getOpenMeetingsWithNames(lang) → s.emit('open_rooms_update')
-
-UI display:
-  useAuthStore.user.language (from JWT payload, ?? null for old tokens)
-  InterviewRoom header badge: capitalize(user?.language ?? 'english')
-  Dashboard subtitle: "Showing English rooms"
+sweeper.stop()
+scheduler.close()
+deepgramManager.stopAll()
+io.close()
+  → pool.end()
+    → process.exit(0)
+10s hard timeout → process.exit(1)
 ```
 
 ---
 
-## 14. Security Model
+## 18. Known Limitations
 
-### `canViewMeeting` (`server/src/policy/canViewMeeting.ts`)
-| Role | Condition |
-|---|---|
-| `supervisor` / `admin` | Always allowed |
-| `interviewer` | `interviewerId === null` (open meeting, allows hydration before join) OR `interviewerId === userId` |
-| `candidate` | `candidateId === userId` |
-| Other | Denied |
+1. **Single-instance only without Redis** — `fetchSockets()`, rate limiter buckets, and `MemoryScheduler` timers are all in-process. Multi-instance requires Redis.
 
-### `canViewCandidateHistory` (`server/src/policy/canViewCandidateHistory.ts`)
-| Role | Condition |
-|---|---|
-| `interviewer` / `supervisor` / `admin` | Always allowed |
-| `candidate` | `candidateId === userId` |
-| Other | Denied |
+2. **No session persistence on restart** — In-memory state is lost. Settle scan + BullMQ handle active meetings; open/waiting rooms with no live sockets are not recovered.
 
-### `join_open_meeting` language pre-flight (`interviewer.ts`)
-Queries `meetings JOIN users ON candidate_id` for the candidate's language before calling `onInterviewerJoin()`. Language mismatch → `ack({ ok: true })` silent (the filtered room list means this is a race-condition guard only). DB error → `ack({ ok: false, code: 'INTERNAL_ERROR' })`. If no row found (meeting already taken), proceeds to `onInterviewerJoin` which throws `InvalidTransitionError` → CONFLICT response.
+3. **Language is immutable post-signup** — Embedded in JWT; change requires re-login and Supabase metadata update.
 
-### What is enforced server-side
-- JWT presence and validity on every HTTP route (`requireAuth`) and socket connection (`requireJwtSocket`)
-- Role matching to namespace (`requireJwtSocket` role parameter)
-- Meeting ownership for `end_meeting`, `join_room` reconnect (checks `interviewerId === userId`)
-- Note authorship for `update_note`, `delete_note`
-- Language filtering in DB queries (not just UI)
-- One-shot reconnect tokens (consumed on use via `DELETE...RETURNING`)
-- Rate limits on all socket events (in-memory sliding window)
-- HTTP rate limit: 20 requests/minute on `/auth` routes
+4. **Supabase env vars always required at startup** — `lib/supabase.ts` exits on any missing Supabase var, even for requests that never touch Supabase.
 
-### Known limitations (not enforced)
-- Supervisor's stealth is enforced by the SUBSCRIBER Agora token (cannot publish) but the supervisor's presence in the Agora channel is visible to Agora's own dashboard
-- Language filtering applies only to the room list query and pre-flight check — once a meeting is active, there is no check preventing a different-language supervisor from joining via `join_room` with a known `meetingId`
-- `canViewMeeting` allows any interviewer to read an open meeting's transcript (necessary for pre-join hydration) — an interviewer could read another interviewer's candidate transcript before joining
-- `/metrics` endpoint is unauthenticated (noted with TODO comment in `server/src/http/metrics.ts:7`)
+5. **`MemoryScheduler` timer loss on restart** — In Redis-absent mode, a crash during a grace window drops the timer. Settle scan runs once and cannot reconstruct remaining grace duration.
 
----
+6. **No end-to-end encryption for transcript data** — Agora handles media encryption; transcript text is stored in plaintext in Supabase PostgreSQL.
 
-## 15. Key Design Decisions & Trade-offs
-
-**1. No Redis — `setTimeout` + DB for job scheduling** (`JobScheduler.ts`). All timers are in-process `setTimeout` calls with `.unref()`. At boot, `recovery.ts` reads `claimed` and `interrupted` meetings from the DB and reschedules their timers. Trade-off: jobs survive planned restarts but are lost on crash if the DB write hasn't committed. Recovery mitigates this for all realistic crash scenarios.
-
-**2. Append-only transcript segments** (`TranscriptService.appendSegment`). Segments are never updated or deleted. Corrections are expressed as `transcript_notes` with an `anchor_segment_id`. `TranscriptBox` displays `note.body` instead of `segment.text` when a note exists for a segment (underlined). Trade-off: historical accuracy is preserved; display logic is slightly more complex.
-
-**3. `socket.data.meetingStatus` cache** (`candidate.ts:218`). The `audio_chunk` handler checks `socket.data.meetingStatus` rather than querying the DB. This avoids a round-trip on every 160-byte PCM chunk (many per second). Trade-off: briefly stale after a meeting status transition — guarded by the `meeting:${meetingId}` room membership check as a secondary guard.
-
-**4. In-flow mobile bottom bar** (`InterviewRoom.jsx:487`). The bottom navigation bar is an in-flow `flex-shrink-0 h-14` element, not `position:fixed`. This avoids the classic mobile-browser virtual keyboard / safe-area bug where fixed-positioned elements overlap content. Trade-off: requires `min-h-0` on all `flex-1` flex children to prevent content from escaping the constrained column layout.
-
-**5. Per-socket broadcast filtering** (`BroadcastHelper.openRoomsUpdate`). Instead of one `emit` to the `open_rooms_monitor` room, the method fetches all sockets in the room and issues one DB query per socket (language-filtered). Trade-off: O(n) DB queries where n is the number of subscribed interviewers. For typical deployments (< 50 concurrent interviewers) this is negligible, and it eliminates the need for each interviewer to filter client-side.
-
-**6. Deterministic SHA-256 Agora UIDs** (`AgoraTokenService.deriveUid`). UID = `SHA-256("meetingId:userId")[0:4] >>> 1 || 1`. No DB lookup on reconnect. Trade-off: collision probability is ~1 in 2^31 per meeting, effectively zero. The `|| 1` avoids Agora's special case for UID 0 ("any user").
-
-**7. No React StrictMode** (`client/src/main.jsx`). StrictMode double-invokes effects in development, which causes `useAgora` to join the Agora channel twice (no idempotency on Agora's SDK) and `useSocket` to create duplicate socket connections. Trade-off: development mode behaves identically to production; double-invoke safety checks are foregone.
-
-**8. Module-level socket singletons** (`useSocket.js:7`). Sockets live outside React state in a module-level map. Component remounts — which are common in React 19's concurrent mode — do not disconnect and reconnect. Trade-off: one socket per role per browser tab; the `session_replaced` event handles multi-tab detection server-side.
-
-**9. In-memory seq counter for transcript** (`TranscriptService.seqCounters`). After the first `appendSegment` call for a meeting, `MAX(seq)` is fetched once and cached. Subsequent calls increment in memory. Trade-off: the counter resets on server restart. The `recovery.ts` boot scan does not re-hydrate seq counters — `appendSegment` re-reads `MAX(seq)` from DB on the first call after restart, so the first post-restart segment gets the correct seq.
-
-**10. Dual-auth pattern (Supabase + internal JWT)** (`auth.ts`). Supabase handles identity (OAuth-compatible, email confirmation, secure password storage). The server then issues its own short-lived JWT containing `userId`, `role`, `language`, and `orgId`. This decouples the socket/API auth from Supabase's token format and TTL. Trade-off: an extra HTTP round-trip on every login/page-load refresh, and two token systems to reason about. The benefit is that internal tokens are fast to verify (local HMAC) and carry custom claims without a Supabase round-trip per request.
+7. **`ClaimService` is dead code in the primary flow** — Claim/queue flow is implemented but unused; the primary path is candidate-created open rooms (`status='open'`). Kept for legacy compatibility.
