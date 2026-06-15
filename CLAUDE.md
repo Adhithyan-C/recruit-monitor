@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 RecruitMonitor is a real-time interview monitoring platform. Interviewers conduct live video interviews (Agora RTC); supervisors silently monitor (stealth mode); Deepgram Nova-2 transcribes candidate audio server-side via Socket.IO.
 
-Monorepo with two packages: `client/` (React 19 + Vite + Tailwind) and `server/` (Node.js + Express + Socket.IO). Plain JavaScript throughout — no TypeScript.
+Monorepo with two packages: `client/` (React 19 + Vite + Tailwind) and `server/` (Node.js + Express + Socket.IO).
+
+**Languages:** Client is plain JavaScript (`.jsx`). Server is TypeScript — entry point is `server/src/server.ts`, run via `tsx` (`node --import tsx/esm src/server.ts` in production, `tsx watch src/server.ts` in dev). No compile step; tsx transpiles on the fly. A legacy `.js` layer exists under `server/src/_legacy_unused/` — those files are not imported by anything and do not run.
 
 ## Dev Commands
 
@@ -29,21 +31,19 @@ cd client && npm run lint # ESLint (client only; no server-side lint config)
 
 **No React StrictMode** — `client/src/main.jsx` deliberately omits `<React.StrictMode>`. StrictMode double-invokes effects and breaks Agora RTC + Socket.IO lifecycle. Do not add it.
 
-**All state is in-memory** — `server/src/state/roomRegistry.js` uses plain Maps. All session data is destroyed when the interview ends. `server/src/db/` exists but is empty (future placeholder). No persistence, no recovery on server restart.
+**State is persisted to Postgres** — `server/src/domain/TranscriptService.ts` buffers transcript segments and flushes to the DB. Meeting state lives in `server/src/domain/MeetingService.ts` backed by `server/src/db/pool.ts`. `server/src/db/` is active; run `npm run migrate` (inside `server/`) to apply migrations.
 
-**Supabase env vars are required at startup** — `server/src/lib/supabase.js` exits with code 1 if any of `SUPABASE_URL`, `SUPABASE_ANON_KEY`, or `SUPABASE_SERVICE_ROLE_KEY` are missing, even if a given request doesn't use Supabase.
+**Supabase env vars are required at startup** — `server/src/lib/supabase.ts` is the live Supabase client; it reads from `config/env.ts` which exits with code 1 on missing vars.
 
-**`_sv_` supervisor prefix** — supervisor Agora UIDs are prefixed `_sv_` (set in `server/src/socket/interviewerHandlers.js`). `client/src/hooks/useAgora.js` filters these out of `remoteUsers`. Never change this prefix without updating both sides.
+**`_sv_` supervisor prefix** — supervisor Agora UIDs are prefixed `_sv_` (set in `server/src/socket/namespaces/interviewer.ts`). `client/src/hooks/useAgora.js` filters these out of `remoteUsers`. Never change this prefix without updating both sides.
 
 ## Socket.IO Namespaces
 
 | Namespace | Auth | Notes |
 |-----------|------|-------|
-| `/interviewer` | JWT required | Creates/ends rooms, edits transcripts |
-| `/candidate` | None (room code acts as credential) | Sends audio chunks for Deepgram |
-| `/supervisor` | JWT required | Stealth — UID prefixed `_sv_`, no audio/video publish, filtered from client view |
-
-Before broadcasting room data to clients, `socketId` fields are stripped to hide socket identity from supervisors.
+| `/interviewer` | JWT required | Creates/ends meetings, edits transcripts — `server/src/socket/namespaces/interviewer.ts` |
+| `/candidate` | Room code (+ optional JWT) | Sends audio chunks for Deepgram — `server/src/socket/namespaces/candidate.ts` |
+| `/supervisor` | JWT required | Stealth — UID prefixed `_sv_`, no audio/video publish, filtered from client view — `server/src/socket/namespaces/supervisor.ts` |
 
 ## Environment Variables
 
@@ -70,7 +70,7 @@ SUPABASE_SERVICE_ROLE_KEY=<service_role_key>
 ## Deployment
 
 - **Client**: Vercel — `npm run build:client`, output `dist/`. `client/vercel.json` handles SPA rewrites.
-- **Server**: Railway — `npm start` (`node src/index.js`). Railway sets `PORT` automatically.
+- **Server**: Railway — `npm start` (`node --import tsx/esm src/server.ts`). Railway sets `PORT` automatically. Dockerfile is at `server/Dockerfile`.
 
 ## Default Test Credentials (local dev)
 
