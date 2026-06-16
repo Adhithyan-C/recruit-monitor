@@ -58,7 +58,13 @@ export async function waitForRedis(timeoutMs = 5_000): Promise<boolean> {
       settle(false);
     }, timeoutMs);
     const onReady = () => settle(true);
-    const onError = () => settle(false);
+    const onError = (err: Error & { code?: string; name?: string }) => {
+      logger.warn(
+        { msg: err.message, code: err.code, name: err.name },
+        'Redis boot-time connect error — using in-memory fallback',
+      );
+      settle(false);
+    };
     redis.once('ready', onReady);
     redis.once('error', onError);
   });
