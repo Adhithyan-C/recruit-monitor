@@ -226,7 +226,7 @@ export class TranscriptService {
          (id, meeting_id, seq, speaker_user_id, speaker_role,
           text, started_at, ended_at, is_final, confidence)
        SELECT * FROM unnest(
-         $1::text[], $2::text[], $3::int[], $4::text[], $5::text[],
+         $1::uuid[], $2::uuid[], $3::int[], $4::uuid[], $5::text[],
          $6::text[], $7::timestamptz[], $8::timestamptz[], $9::bool[], $10::float8[]
        )`,
       [ids, meetingIds, seqs, speakerIds, roles, texts, startedAts, endedAts, isFinals, confidences],
