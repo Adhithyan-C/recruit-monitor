@@ -33,6 +33,7 @@ import { DeepgramManager } from './lib/DeepgramManager.js';
 // ── Express app ───────────────────────────────────────────────────────
 
 const app = express();
+app.set('trust proxy', 1);
 
 const allowedOrigins = env.CLIENT_ORIGIN.split(',').map((s) => s.trim());
 
