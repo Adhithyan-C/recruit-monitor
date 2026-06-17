@@ -146,7 +146,7 @@ export default function useAgora({ role, channelName }) {
   // Called explicitly by the component after receiving the server join ack.
   // agoraToken and uid are server-assigned — not derived client-side.
 
-  const joinChannel = useCallback(async (agoraToken, uid) => {
+  const joinChannel = useCallback(async (agoraToken, uid, { initialMicEnabled = true, initialCamEnabled = true } = {}) => {
     if (joiningRef.current || isJoined) return;
     if (!channelName || !agoraToken || uid == null || !AGORA_APP_ID) return;
 
@@ -173,6 +173,10 @@ export default function useAgora({ role, channelName }) {
             mediaLog('warn', 'agora audio track ended', { role, channelName });
             recreateAudioTrackRef.current?.();
           });
+          if (!initialMicEnabled) {
+            await audioTrack.setEnabled(false);
+            setIsMuted(true);
+          }
           localAudioTrackRef.current = audioTrack;
           setLocalAudioTrack(audioTrack);
         } catch (err) {
@@ -188,6 +192,10 @@ export default function useAgora({ role, channelName }) {
           videoTrack.on('track-ended', () =>
             mediaLog('warn', 'agora video track ended', { role, channelName }),
           );
+          if (!initialCamEnabled) {
+            await videoTrack.setEnabled(false);
+            setIsCameraOff(true);
+          }
           localVideoTrackRef.current = videoTrack;
           setLocalVideoTrack(videoTrack);
         } catch (err) {
@@ -259,11 +267,7 @@ export default function useAgora({ role, channelName }) {
         // Resume AudioContext before re-enabling — third call site.
         await resumeAudioContext();
       }
-      if (typeof track.setMuted === 'function') {
-        await track.setMuted(nextMuted);
-      } else {
-        await track.setEnabled(!nextMuted);
-      }
+      await track.setEnabled(!nextMuted);
       setIsMuted(nextMuted);
       mediaLog('info', 'agora audio mute toggled', { role, channelName, muted: nextMuted });
     } catch (err) {

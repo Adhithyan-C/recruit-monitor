@@ -10,8 +10,10 @@ export default function CandidateWaitingRoom() {
   const logout            = useAuthStore((s) => s.logout);
   const setMeetingJoined  = useMeetingStore((s) => s.setMeetingJoined);
 
-  const videoRef   = useRef(null);
-  const streamRef  = useRef(null);
+  const videoRef       = useRef(null);
+  const streamRef      = useRef(null);
+  const micEnabledRef  = useRef(true);
+  const camEnabledRef  = useRef(true);
 
   const [micEnabled,   setMicEnabled]   = useState(true);
   const [camEnabled,   setCamEnabled]   = useState(true);
@@ -53,7 +55,12 @@ export default function CandidateWaitingRoom() {
         candidateAgoraUid:   payload.participantUids?.candidateUid ?? null,
       });
       navigate(`/room/${payload.meetingId}`, {
-        state: { agoraToken: payload.agoraToken, uid: payload.uid },
+        state: {
+          agoraToken:        payload.agoraToken,
+          uid:               payload.uid,
+          initialMicEnabled: micEnabledRef.current,
+          initialCamEnabled: camEnabledRef.current,
+        },
       });
     };
 
@@ -61,21 +68,58 @@ export default function CandidateWaitingRoom() {
     return () => { socket.off('meeting_attached', onMeetingAttached); };
   }, [navigate, setMeetingJoined, user?.userId]);
 
-  const toggleMic = useCallback(() => {
-    setMicEnabled((prev) => {
-      const next = !prev;
-      streamRef.current?.getAudioTracks().forEach((t) => { t.enabled = next; });
-      return next;
-    });
-  }, []);
+  const toggleMic = useCallback(async () => {
+    if (micEnabled) {
+      const stream = streamRef.current;
+      if (stream) stream.getAudioTracks().forEach((t) => { t.stop(); stream.removeTrack(t); });
+      micEnabledRef.current = false;
+      setMicEnabled(false);
+    } else {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const [track] = s.getAudioTracks();
+        if (track) {
+          if (!streamRef.current) {
+            streamRef.current = new MediaStream([track]);
+          } else {
+            streamRef.current.addTrack(track);
+          }
+        }
+        setError('');
+        micEnabledRef.current = true;
+        setMicEnabled(true);
+      } catch {
+        setError('Microphone access was denied. Please check your browser permissions.');
+      }
+    }
+  }, [micEnabled]);
 
-  const toggleCam = useCallback(() => {
-    setCamEnabled((prev) => {
-      const next = !prev;
-      streamRef.current?.getVideoTracks().forEach((t) => { t.enabled = next; });
-      return next;
-    });
-  }, []);
+  const toggleCam = useCallback(async () => {
+    if (camEnabled) {
+      const stream = streamRef.current;
+      if (stream) stream.getVideoTracks().forEach((t) => { t.stop(); stream.removeTrack(t); });
+      camEnabledRef.current = false;
+      setCamEnabled(false);
+    } else {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ video: true });
+        const [track] = s.getVideoTracks();
+        if (track) {
+          if (!streamRef.current) {
+            streamRef.current = new MediaStream([track]);
+            if (videoRef.current) videoRef.current.srcObject = streamRef.current;
+          } else {
+            streamRef.current.addTrack(track);
+          }
+        }
+        setError('');
+        camEnabledRef.current = true;
+        setCamEnabled(true);
+      } catch {
+        setError('Camera access was denied. Please check your browser permissions.');
+      }
+    }
+  }, [camEnabled]);
 
   const handleStart = useCallback(() => {
     if (starting) return;

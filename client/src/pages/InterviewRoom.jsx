@@ -278,8 +278,13 @@ export default function InterviewRoom() {
 
   // Join Agora when credentials are available — joinChannel's internal guard prevents double-join
   useEffect(() => {
-    const { agoraToken, uid } = agoraCredentials ?? {};
-    if (agoraToken && uid != null && agoraChannel) joinChannel(agoraToken, uid);
+    const { agoraToken, uid, initialMicEnabled, initialCamEnabled } = agoraCredentials ?? {};
+    if (agoraToken && uid != null && agoraChannel) {
+      joinChannel(agoraToken, uid, {
+        initialMicEnabled: initialMicEnabled ?? true,
+        initialCamEnabled: initialCamEnabled ?? true,
+      });
+    }
   }, [agoraCredentials, agoraChannel, joinChannel]);
 
   // Socket events — all logic identical to before
