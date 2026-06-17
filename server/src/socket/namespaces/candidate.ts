@@ -11,7 +11,7 @@ import { attachReconnectSession } from '../middleware/attachReconnectSession.js'
 import { audioChunkSchema, heartbeatSchema, startSessionSchema } from '../schemas/candidate.js';
 import { addNoteSchema, updateNoteSchema, deleteNoteSchema } from '../schemas/interviewer.js';
 import { shareVideoSchema, videoSyncSchema } from '../schemas/video.js';
-import { ForbiddenError, InvalidTransitionError, NotFoundError } from '../../lib/errors.js';
+import { ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { CandidateSocket } from '../types.js';
 import { onSafe } from '../safeHandler.js';
@@ -124,82 +124,80 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
     logger.info({ socketId: socket.id, userId, attachedMeeting }, 'candidate connected');
 
     // ── Start session (pre-join → create open room) ───────────────────────
-    // Only registered if the candidate does NOT already have an active meeting.
-    // Once the meeting is created this handler becomes a no-op (socket.data.meetingId is set).
+    // Always registered. Returns CONFLICT if the candidate already has an active
+    // meeting, clears a stale meetingId if the prior meeting ended, then creates a new room.
 
-    if (!attachedMeeting) {
-      onSafe(socket, {
-        event: 'start_session',
-        schema: startSessionSchema,
-        rateLimit: { limit: 20, windowMs: 60_000 },
-      }, async (_payload, { ack }) => {
-        try {
-          if (socket.data.meetingId) {
-            // The candidate may have navigated back from an ended meeting without
-            // disconnecting the socket, leaving meetingId stale. Verify the meeting
-            // is still in a live state before blocking the new session.
-            try {
-              const existing = await meetingService.getMeeting(socket.data.meetingId);
-              if (existing.status !== 'ended') {
-                ack({ ok: false, error: 'Session already started', code: 'CONFLICT' });
-                return;
-              }
-            } catch (err) {
-              if (!(err instanceof NotFoundError)) {
-                logger.error({ err, meetingId: socket.data.meetingId }, 'start_session: stale meeting check failed');
-                ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
-                return;
-              }
-              // Meeting not found — treat meetingId as stale, fall through.
+    onSafe(socket, {
+      event: 'start_session',
+      schema: startSessionSchema,
+      rateLimit: { limit: 20, windowMs: 60_000 },
+    }, async (_payload, { ack }) => {
+      try {
+        if (socket.data.meetingId) {
+          // The candidate may have navigated back from an ended meeting without
+          // disconnecting the socket, leaving meetingId stale. Verify the meeting
+          // is still in a live state before blocking the new session.
+          try {
+            const existing = await meetingService.getMeeting(socket.data.meetingId);
+            if (existing.status !== 'ended') {
+              ack({ ok: false, error: 'Session already started', code: 'CONFLICT' });
+              return;
             }
-            // Meeting ended or missing — clear stale meetingId and allow new session.
-            // Also reset the rate-limit bucket so navigating back from an ended meeting
-            // doesn't exhaust the window before the candidate can start a new one.
-            socket.data.meetingId = undefined;
-            resetSocketRateLimit(socket, 'start_session');
+          } catch (err) {
+            if (!(err instanceof NotFoundError)) {
+              logger.error({ err, meetingId: socket.data.meetingId }, 'start_session: stale meeting check failed');
+              ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+              return;
+            }
+            // Meeting not found — treat meetingId as stale, fall through.
           }
-
-          const { meetingId, agoraChannel } = await meetingService.createOpenMeeting(userId);
-
-          socket.data.meetingId     = meetingId;
-          socket.data.meetingStatus = 'open';
-          await socket.join(`meeting:${meetingId}`);
-
-          const uid = AgoraTokenService.deriveUid(meetingId, userId);
-          const agoraToken = agoraTokenService.generateToken({
-            channelName: agoraChannel,
-            uid,
-            role: 'publisher',
-          });
-
-          const participantUids = {
-            interviewerUid: null,
-            candidateUid:   AgoraTokenService.deriveUid(meetingId, userId),
-          };
-
-          socket.emit('meeting_attached', {
-            meetingId,
-            status:        'open',
-            agoraChannel,
-            agoraToken,
-            uid,
-            candidateId:   userId,
-            interviewerId: null,
-            participantUids,
-          });
-
-          // Notify interviewer dashboards — fire-and-forget, must not block the ack.
-          broadcast.openRoomsUpdate()
-            .catch((err) => logger.error({ err }, 'openRoomsUpdate after start_session failed'));
-
-          ack({ ok: true, data: { meetingId, agoraChannel, agoraToken, uid, participantUids } });
-          logger.info({ socketId: socket.id, userId, meetingId }, 'start_session: open meeting created');
-        } catch (err) {
-          logger.error({ err, userId }, 'start_session: unhandled error');
-          ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+          // Meeting ended or missing — clear stale meetingId and allow new session.
+          // Also reset the rate-limit bucket so navigating back from an ended meeting
+          // doesn't exhaust the window before the candidate can start a new one.
+          socket.data.meetingId = undefined;
+          resetSocketRateLimit(socket, 'start_session');
         }
-      });
-    }
+
+        const { meetingId, agoraChannel } = await meetingService.createOpenMeeting(userId);
+
+        socket.data.meetingId     = meetingId;
+        socket.data.meetingStatus = 'open';
+        await socket.join(`meeting:${meetingId}`);
+
+        const uid = AgoraTokenService.deriveUid(meetingId, userId);
+        const agoraToken = agoraTokenService.generateToken({
+          channelName: agoraChannel,
+          uid,
+          role: 'publisher',
+        });
+
+        const participantUids = {
+          interviewerUid: null,
+          candidateUid:   AgoraTokenService.deriveUid(meetingId, userId),
+        };
+
+        socket.emit('meeting_attached', {
+          meetingId,
+          status:        'open',
+          agoraChannel,
+          agoraToken,
+          uid,
+          candidateId:   userId,
+          interviewerId: null,
+          participantUids,
+        });
+
+        // Notify interviewer dashboards — fire-and-forget, must not block the ack.
+        broadcast.openRoomsUpdate()
+          .catch((err) => logger.error({ err }, 'openRoomsUpdate after start_session failed'));
+
+        ack({ ok: true, data: { meetingId, agoraChannel, agoraToken, uid, participantUids } });
+        logger.info({ socketId: socket.id, userId, meetingId }, 'start_session: open meeting created');
+      } catch (err) {
+        logger.error({ err, userId }, 'start_session: unhandled error');
+        ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+      }
+    });
 
     // ── Heartbeat ─────────────────────────────────────────────────────────
 
