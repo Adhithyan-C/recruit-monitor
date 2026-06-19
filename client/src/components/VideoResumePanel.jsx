@@ -3,6 +3,15 @@ import useVideoResume from '../hooks/useVideoResume.js';
 
 const MAX_FILE_BYTES = 120 * 1024 * 1024; // 120 MB
 
+function formatApprovedAt(isoString) {
+  if (!isoString) return '';
+  try {
+    return new Date(isoString).toLocaleString();
+  } catch {
+    return isoString;
+  }
+}
+
 export default function VideoResumePanel({
   socket,
   meetingId,
@@ -15,6 +24,8 @@ export default function VideoResumePanel({
   onClearSharedVideo,
   videoRef,
   syncingRef,
+  activeVideo,
+  onApproveClick,
 }) {
   const {
     uploadVideo,
@@ -72,6 +83,7 @@ export default function VideoResumePanel({
 
   const isSupervisor = role === 'supervisor';
   const isInterviewer = role === 'interviewer';
+  const isApproved = activeVideo?.isApproved === true;
 
   return (
     <div className="h-full flex flex-col p-4 gap-4 overflow-y-auto">
@@ -103,11 +115,38 @@ export default function VideoResumePanel({
           <p className="text-xs text-surface-500">
             Shared by participant
           </p>
+
+          {isApproved && (
+            <div className="flex items-center gap-2 py-2 px-3 rounded-xl bg-success-500/10 border border-success-500/20">
+              <svg className="w-4 h-4 text-success-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+              <span className="text-sm text-success-400">
+                ✓ Video approved
+                {activeVideo?.approvedAt && ` on ${formatApprovedAt(activeVideo.approvedAt)}`}
+                {activeVideo?.approvedBy && ` by ${activeVideo.approvedBy}`}
+              </span>
+            </div>
+          )}
+
+          {!isApproved && activeVideo && isInterviewer && (
+            <button
+              onClick={() => onApproveClick?.(activeVideo.videoId)}
+              className="w-full py-2.5 px-4 rounded-xl bg-danger-500/10 border border-danger-500/30 text-danger-400 text-sm font-medium hover:bg-danger-500/20 transition-colors"
+            >
+              Approve Video
+            </button>
+          )}
         </div>
       )}
 
       {/* ── Upload / record controls (candidate + interviewer) ───────── */}
-      {!isSupervisor && (
+      {!isSupervisor && isApproved && (
+        <p className="text-xs text-surface-500 text-center py-2">
+          Video has been approved — no further uploads allowed
+        </p>
+      )}
+      {!isSupervisor && !isApproved && (
         <div className="flex flex-col gap-3">
           <p className="text-xs text-surface-400 font-medium uppercase tracking-wider">
             {isInterviewer ? 'Record or share video' : 'Share video resume'}

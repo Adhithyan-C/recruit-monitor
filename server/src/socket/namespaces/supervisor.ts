@@ -112,9 +112,11 @@ export function registerSupervisorNamespace(io: Server, deps: SupervisorDeps): v
 
         await socket.join(`meeting:${meetingId}`);
 
-        const [segments, notes] = await Promise.all([
+        const [segments, notes, activeVideo] = await Promise.all([
           transcriptService.getSegments(meetingId),
           transcriptService.getNotes(meetingId),
+          meetingService.getActiveVideoForCandidate(meeting.candidateId)
+            .catch((err) => { logger.error({ err, meetingId }, 'getActiveVideoForCandidate failed'); return null; }),
         ]);
 
         ack({ ok: true, data: {
@@ -129,6 +131,7 @@ export function registerSupervisorNamespace(io: Server, deps: SupervisorDeps): v
               : null,
             candidateUid: AgoraTokenService.deriveUid(meetingId, meeting.candidateId),
           },
+          activeVideo,
         } });
         logger.info({ userId, meetingId }, 'supervisor joined meeting room');
       } catch (err) {

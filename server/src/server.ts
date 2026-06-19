@@ -188,9 +188,9 @@ async function main(): Promise<void> {
         ? 404
         : err.code === 'AUTH_ERROR'
           ? 401
-          : err.code === 'FORBIDDEN'
+          : err.code === 'FORBIDDEN' || err.code === 'VIDEO_APPROVED_LOCKED'
             ? 403
-            : err.code === 'CONFLICT'
+            : err.code === 'CONFLICT' || err.code === 'ALREADY_APPROVED'
               ? 409
               : err.code === 'VALIDATION_ERROR'
                 ? 400

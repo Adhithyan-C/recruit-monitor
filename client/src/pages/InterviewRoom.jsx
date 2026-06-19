@@ -15,6 +15,7 @@ import HistoryPanel from '../components/HistoryPanel.jsx';
 import RoomControls from '../components/RoomControls.jsx';
 import ParticipantPanel from '../components/ParticipantPanel.jsx';
 import VideoResumePanel from '../components/VideoResumePanel.jsx';
+import ApproveVideoModal from '../components/ApproveVideoModal.jsx';
 
 // ── Mobile helpers ─────────────────────────────────────────────────────
 
@@ -82,7 +83,7 @@ function TabIcon({ id }) {
 function PanelContent({
   activeTab, historyOpened, socket, effectiveMeetingId,
   role, remoteUsers, candidateName, interviewerName, candidateAgoraUid, candidateId,
-  sharedVideo, onClearSharedVideo, videoRef, syncingRef,
+  sharedVideo, onClearSharedVideo, videoRef, syncingRef, activeVideo, onApproveClick,
 }) {
   return (
     <div className="flex-1 min-h-0 overflow-hidden">
@@ -112,6 +113,8 @@ function PanelContent({
           onClearSharedVideo={onClearSharedVideo}
           videoRef={videoRef}
           syncingRef={syncingRef}
+          activeVideo={activeVideo}
+          onApproveClick={onApproveClick}
         />
       )}
       {/* History stays mounted after first open to preserve scroll position */}
@@ -145,6 +148,8 @@ export default function InterviewRoom() {
   const clearMeeting        = useMeetingStore((s) => s.clearMeeting);
   const setMeetingJoined    = useMeetingStore((s) => s.setMeetingJoined);
   const applyMeetingStatus  = useMeetingStore((s) => s.applyMeetingStatus);
+  const activeVideo         = useMeetingStore((s) => s.activeVideo);
+  const setActiveVideo      = useMeetingStore((s) => s.setActiveVideo);
 
   const addSegment             = useTranscriptStore((s) => s.addSegment);
   const setTranscriptionFailed = useTranscriptStore((s) => s.setTranscriptionFailed);
@@ -163,6 +168,9 @@ export default function InterviewRoom() {
   const [activeTab,            setActiveTab]            = useState('transcript');
   const [agoraCredentials,     setAgoraCredentials]     = useState(locState ?? null);
   const [sharedVideo,          setSharedVideo]          = useState(null); // { videoId, signedUrl, sharedBy } | null
+  const [approveModalOpen,     setApproveModalOpen]     = useState(false);
+  const [approveTargetVideoId, setApproveTargetVideoId] = useState(null);
+  const [approveError,         setApproveError]         = useState(null);
 
   const interruptedTimerRef = useRef(null);
   const videoRef            = useRef(null);   // shared with VideoResumePanel for sync handlers
@@ -297,7 +305,15 @@ export default function InterviewRoom() {
     };
     const onDisconnect = () => setConnectionLost(true);
 
-    const onMeetingAttached = (payload) => { hydrateMeeting(payload); };
+    const onMeetingAttached = (payload) => {
+      if (payload.activeVideo) {
+        startTransition(() => {
+          setActiveVideo(payload.activeVideo);
+          setSharedVideo(payload.activeVideo);
+        });
+      }
+      hydrateMeeting(payload);
+    };
 
     const onMeetingStatus = ({ meetingId: mid, status, interviewerName: evtInterviewerName, participantUids }) => {
       startTransition(() => applyMeetingStatus({ meetingId: mid, status }));
@@ -345,7 +361,30 @@ export default function InterviewRoom() {
     const onNoteUpdated       = ({ noteId, body, updatedAt }) => updateNote({ noteId, body, updatedAt });
     const onNoteDeleted       = ({ noteId })                   => removeNote(noteId);
 
-    const onVideoAvailable = (payload) => { startTransition(() => setSharedVideo(payload)); };
+    const onVideoAvailable = (payload) => {
+      startTransition(() => {
+        setSharedVideo(payload);
+        // A newly shared video is by definition newer than whatever was active —
+        // reflect it now so a reload picks the correct video as "active".
+        setActiveVideo({
+          videoId:      payload.videoId,
+          signedUrl:    payload.signedUrl,
+          isApproved:   false,
+          uploaderRole: null,
+          uploaderName: null,
+          uploadedAt:   new Date().toISOString(),
+          approvedBy:   null,
+          approvedAt:   null,
+        });
+      });
+    };
+
+    const onVideoApproved = ({ videoId, approvedAt, approvedByName }) => {
+      startTransition(() => {
+        const cur = useMeetingStore.getState().activeVideo;
+        setActiveVideo({ ...(cur ?? {}), videoId, isApproved: true, approvedAt, approvedBy: approvedByName });
+      });
+    };
     const onPlaySync = ({ currentTime }) => {
       const video = videoRef.current;
       if (!video) return;
@@ -382,6 +421,7 @@ export default function InterviewRoom() {
     socket.on('note_updated',       onNoteUpdated);
     socket.on('note_deleted',       onNoteDeleted);
     socket.on('video_available',    onVideoAvailable);
+    socket.on('video_approved',     onVideoApproved);
     socket.on('video_play_sync',    onPlaySync);
     socket.on('video_pause_sync',   onPauseSync);
     socket.on('video_seek_sync',    onSeekSync);
@@ -399,11 +439,12 @@ export default function InterviewRoom() {
       socket.off('note_updated',       onNoteUpdated);
       socket.off('note_deleted',       onNoteDeleted);
       socket.off('video_available',    onVideoAvailable);
+      socket.off('video_approved',     onVideoApproved);
       socket.off('video_play_sync',    onPlaySync);
       socket.off('video_pause_sync',   onPauseSync);
       socket.off('video_seek_sync',    onSeekSync);
     };
-  }, [socket, role, socketRole, applyMeetingStatus, setMeetingJoined, addSegment, setTranscriptionFailed, addNote, updateNote, removeNote, hydrateMeeting]);
+  }, [socket, role, socketRole, applyMeetingStatus, setMeetingJoined, addSegment, setTranscriptionFailed, addNote, updateNote, removeNote, hydrateMeeting, setActiveVideo]);
 
   // Terminated countdown → redirect
   useEffect(() => {
@@ -447,6 +488,31 @@ export default function InterviewRoom() {
     else navigate('/candidate');
   }, [role, socket, meetingId, meetingIdParam, leaveChannel, clearMeeting, clearTranscript, navigate]);
 
+  const handleApproveClick = useCallback((videoId) => {
+    setApproveError(null);
+    setApproveTargetVideoId(videoId);
+    setApproveModalOpen(true);
+  }, []);
+
+  const handleApproveConfirm = useCallback(() => {
+    if (!socket || !approveTargetVideoId) return;
+    const targetMeetingId = meetingId ?? meetingIdParam;
+    socket.emit('approve_video', { meetingId: targetMeetingId, videoId: approveTargetVideoId }, (ack) => {
+      if (ack.ok) {
+        setApproveModalOpen(false);
+        setApproveTargetVideoId(null);
+      } else {
+        setApproveError(ack.error ?? 'Failed to approve video');
+      }
+    });
+  }, [socket, meetingId, meetingIdParam, approveTargetVideoId]);
+
+  const handleApproveCancel = useCallback(() => {
+    setApproveModalOpen(false);
+    setApproveTargetVideoId(null);
+    setApproveError(null);
+  }, []);
+
   // Convenience: resolved names for the current role
   const resolvedInterviewerName = interviewerName ?? (role === 'interviewer' ? user?.name : null);
   const resolvedCandidateName   = candidateName   ?? (role === 'candidate'   ? user?.name : null);
@@ -467,6 +533,8 @@ export default function InterviewRoom() {
     onClearSharedVideo: () => setSharedVideo(null),
     videoRef,
     syncingRef,
+    activeVideo,
+    onApproveClick: handleApproveClick,
   };
 
   // ── Render ────────────────────────────────────────────────────────────
@@ -733,6 +801,18 @@ export default function InterviewRoom() {
               ))}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ── Approve video confirmation modal ────────────────────────── */}
+      <ApproveVideoModal
+        isOpen={approveModalOpen}
+        onConfirm={handleApproveConfirm}
+        onCancel={handleApproveCancel}
+      />
+      {approveModalOpen && approveError && (
+        <div className="fixed bottom-4 right-4 z-50 bg-danger-500/15 border border-danger-500/30 text-danger-400 text-sm px-4 py-3 rounded-lg shadow-lg max-w-sm">
+          {approveError}
         </div>
       )}
     </div>

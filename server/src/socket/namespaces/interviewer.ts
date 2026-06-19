@@ -16,8 +16,8 @@ import {
   updateNoteSchema,
   deleteNoteSchema,
 } from '../schemas/interviewer.js';
-import { shareVideoSchema, videoSyncSchema } from '../schemas/video.js';
-import { ForbiddenError, InvalidTransitionError, NotFoundError } from '../../lib/errors.js';
+import { shareVideoSchema, videoSyncSchema, approveVideoSchema } from '../schemas/video.js';
+import { ForbiddenError, InvalidTransitionError, NotFoundError, ConflictError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { InterviewerSocket } from '../types.js';
 import { onSafe } from '../safeHandler.js';
@@ -149,6 +149,9 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
           .then((sockets) => { for (const cs of sockets) cs.data.meetingStatus = 'active'; })
           .catch((err) => logger.error({ err, meetingId }, 'failed to update candidate meetingStatus on interviewer join'));
 
+        const activeVideo = await meetingService.getActiveVideoForCandidate(candidateId)
+          .catch((err) => { logger.error({ err, meetingId }, 'getActiveVideoForCandidate failed'); return null; });
+
         socket.emit('meeting_attached', {
           meetingId,
           status:        'active',
@@ -158,6 +161,7 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
           candidateId,
           interviewerId: userId,
           participantUids: { interviewerUid: uid, candidateUid },
+          activeVideo,
         });
 
         ack({ ok: true });
@@ -420,6 +424,44 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
       io.of('/supervisor').in(`meeting:${meetingId}`).emit('video_seek_sync', syncPayload);
     });
 
+    onSafe(socket, {
+      event: 'approve_video',
+      schema: approveVideoSchema,
+      rateLimit: { limit: 5, windowMs: 60_000 },
+    }, async ({ meetingId, videoId }, { ack }) => {
+      if (!socket.rooms.has(`meeting:${meetingId}`)) {
+        ack({ ok: false, error: 'Not in meeting room', code: 'FORBIDDEN' });
+        return;
+      }
+      try {
+        const { approvedAt } = await meetingService.approveVideo(meetingId, videoId, userId);
+
+        const { rows: userRows } = await pool.query<{ name: string }>(
+          `SELECT name FROM users WHERE id = $1`,
+          [userId],
+        );
+        const approvedByName = userRows[0]?.name ?? null;
+
+        const meeting = await meetingService.getMeeting(meetingId);
+        const payload = { candidateId: meeting.candidateId, videoId, approvedAt, approvedByName };
+        io.of('/interviewer').in(`meeting:${meetingId}`).emit('video_approved', payload);
+        io.of('/candidate').in(`meeting:${meetingId}`).emit('video_approved', payload);
+        io.of('/supervisor').in(`meeting:${meetingId}`).emit('video_approved', payload);
+
+        ack({ ok: true });
+        logger.info({ userId, meetingId, videoId }, 'approve_video: video approved');
+      } catch (err) {
+        if (err instanceof ConflictError) ack({ ok: false, error: err.message, code: 'ALREADY_APPROVED' });
+        else if (err instanceof ForbiddenError) ack({ ok: false, error: err.message, code: 'FORBIDDEN' });
+        else if (err instanceof NotFoundError) ack({ ok: false, error: err.message, code: 'NOT_FOUND' });
+        else if (err instanceof InvalidTransitionError) ack({ ok: false, error: 'Cannot approve in current meeting state', code: 'CONFLICT' });
+        else {
+          logger.error({ err, meetingId, videoId }, 'approve_video failed');
+          ack({ ok: false, error: 'Internal error', code: 'INTERNAL_ERROR' });
+        }
+      }
+    });
+
     // Reconnect path: attach to an interrupted meeting if one exists.
     // All listeners are registered above so no events are dropped during this await.
     const currentMeeting = await meetingService.resumeOrAttachCurrentMeeting(userId, 'interviewer');
@@ -442,6 +484,9 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
           role: 'publisher',
         });
 
+        const activeVideo = await meetingService.getActiveVideoForCandidate(currentMeeting.candidateId)
+          .catch((err) => { logger.error({ err, meetingId: currentMeeting.id }, 'getActiveVideoForCandidate failed'); return null; });
+
         socket.emit('meeting_attached', {
           meetingId:     currentMeeting.id,
           status,
@@ -456,6 +501,7 @@ export function registerInterviewerNamespace(io: Server, deps: InterviewerDeps):
               : null,
             candidateUid: AgoraTokenService.deriveUid(currentMeeting.id, currentMeeting.candidateId),
           },
+          activeVideo,
         });
 
         logger.info(

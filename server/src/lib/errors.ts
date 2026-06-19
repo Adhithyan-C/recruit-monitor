@@ -31,8 +31,8 @@ export class NotFoundError extends DomainError {
 }
 
 export class ConflictError extends DomainError {
-  constructor(message = 'Conflict') {
-    super(message, 'CONFLICT');
+  constructor(message = 'Conflict', code = 'CONFLICT') {
+    super(message, code);
   }
 }
 
@@ -46,7 +46,7 @@ export class InvalidTransitionError extends DomainError {
 }
 
 export class ForbiddenError extends DomainError {
-  constructor(message = 'Forbidden') {
-    super(message, 'FORBIDDEN');
+  constructor(message = 'Forbidden', code = 'FORBIDDEN') {
+    super(message, code);
   }
 }

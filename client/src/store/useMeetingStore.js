@@ -20,6 +20,10 @@ const initialState = {
   //   interrupted — one side lost connection; grace window open
   //   ended       — meeting terminated; component should navigate away then call clearMeeting
   status: 'idle',
+
+  // Candidate's currently-active video resume — { videoId, signedUrl, isApproved,
+  // uploaderRole, uploaderName, uploadedAt, approvedBy, approvedAt } | null.
+  activeVideo: null,
 };
 
 export const useMeetingStore = create((set) => ({
@@ -60,6 +64,9 @@ export const useMeetingStore = create((set) => ({
       candidateName:   candidateName   ?? s.candidateName,
       interviewerName: interviewerName ?? s.interviewerName,
     })),
+
+  setActiveVideo: (payload) => set({ activeVideo: payload }),
+  clearActiveVideo: () => set({ activeVideo: null }),
 
   // Full reset — call after navigating away from the ended meeting.
   clearMeeting: () => set(initialState),

@@ -4,7 +4,8 @@ import type { TranscriptService } from './TranscriptService.js';
 import type { DeepgramManager } from '../lib/DeepgramManager.js';
 import { logger } from '../lib/logger.js';
 import { newId } from '../lib/ids.js';
-import { NotFoundError, InvalidTransitionError, ConflictError } from '../lib/errors.js';
+import { NotFoundError, InvalidTransitionError, ConflictError, ForbiddenError } from '../lib/errors.js';
+import { supabaseAdmin } from '../lib/supabase.js';
 import {
   guardMeetingTransition,
   guardCandidateTransition,
@@ -62,6 +63,30 @@ interface MeetingRowWithNames extends MeetingRow {
 interface CandidatePresenceRow {
   user_id: string;
   status: CandidateStatus;
+}
+
+export interface ActiveVideoDetails {
+  videoId: string;
+  signedUrl: string;
+  isApproved: boolean;
+  uploaderRole: 'candidate' | 'interviewer';
+  uploaderName: string;
+  uploadedAt: string;
+  approvedBy: string | null;
+  approvedAt: string | null;
+}
+
+interface MeetingVideoRow {
+  id: string;
+  candidate_id: string;
+  interviewer_id: string | null;
+  candidate_name: string;
+  interviewer_name: string | null;
+  storage_path: string;
+  type: 'candidate_upload' | 'interviewer_recording';
+  created_at: Date;
+  approved_at: Date | null;
+  approved_by: string | null;
 }
 
 export class MeetingService {
@@ -664,6 +689,111 @@ export class MeetingService {
         this.deps.deepgramManager.stop(meetingId);
       }
       logger.info({ meetingId, reason }, 'meeting ended');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Returns the candidate's currently-active video resume: an approved video
+   * always wins over a newer unapproved one; within unapproved videos the
+   * most recent wins. Returns null if the candidate has no videos.
+   */
+  async getActiveVideoForCandidate(candidateId: string): Promise<ActiveVideoDetails | null> {
+    const { rows } = await this.deps.pool.query<MeetingVideoRow>(
+      `SELECT * FROM meeting_videos WHERE candidate_id = $1
+        ORDER BY (approved_at IS NOT NULL) DESC, created_at DESC LIMIT 1`,
+      [candidateId],
+    );
+    const row = rows[0];
+    if (!row) return null;
+
+    const { data, error } = await supabaseAdmin.storage
+      .from('interview-videos')
+      .createSignedUrl(row.storage_path, 3600);
+    if (error || !data) {
+      logger.error({ error, candidateId, videoId: row.id }, 'getActiveVideoForCandidate: signed URL generation failed');
+      throw new Error('Failed to generate signed URL for active video');
+    }
+
+    const uploaderRole: 'candidate' | 'interviewer' = row.type === 'candidate_upload' ? 'candidate' : 'interviewer';
+    const uploaderName = uploaderRole === 'candidate' ? row.candidate_name : (row.interviewer_name ?? 'Unknown');
+
+    let approvedByName: string | null = null;
+    if (row.approved_by) {
+      const { rows: approverRows } = await this.deps.pool.query<{ name: string }>(
+        `SELECT name FROM users WHERE id = $1`,
+        [row.approved_by],
+      );
+      approvedByName = approverRows[0]?.name ?? null;
+    }
+
+    return {
+      videoId:      row.id,
+      signedUrl:    data.signedUrl,
+      isApproved:   row.approved_at !== null,
+      uploaderRole,
+      uploaderName,
+      uploadedAt:   row.created_at.toISOString(),
+      approvedBy:   approvedByName,
+      approvedAt:   row.approved_at ? row.approved_at.toISOString() : null,
+    };
+  }
+
+  /**
+   * Marks a video as the candidate's permanent, approved video. Only the
+   * active interviewer on the meeting may approve, and only one video per
+   * candidate may ever be approved (enforced by a partial unique index —
+   * a 23505 violation here means a concurrent approval won the race).
+   */
+  async approveVideo(meetingId: string, videoId: string, interviewerId: string): Promise<{ approvedAt: string }> {
+    const client = await this.deps.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const { rows: meetingRows } = await client.query<MeetingRow>(
+        `SELECT id, candidate_id, interviewer_id, agora_channel, status FROM meetings WHERE id = $1 FOR UPDATE`,
+        [meetingId],
+      );
+      const meeting = meetingRows[0];
+      if (!meeting) throw new NotFoundError(`Meeting ${meetingId} not found`);
+
+      if (meeting.interviewer_id !== interviewerId) {
+        throw new ForbiddenError('not the active interviewer');
+      }
+      if (meeting.status !== 'active' && meeting.status !== 'interrupted') {
+        throw new InvalidTransitionError(meeting.status, 'approve_video');
+      }
+
+      const { rows: videoRows } = await client.query<{ candidate_id: string }>(
+        `SELECT candidate_id FROM meeting_videos WHERE id = $1`,
+        [videoId],
+      );
+      const video = videoRows[0];
+      if (!video || video.candidate_id !== meeting.candidate_id) {
+        throw new NotFoundError(`Video ${videoId} not found for this meeting's candidate`);
+      }
+
+      let approvedAt: Date;
+      try {
+        const { rows: updateRows } = await client.query<{ approved_at: Date }>(
+          `UPDATE meeting_videos SET approved_at = now(), approved_by = $1 WHERE id = $2 RETURNING approved_at`,
+          [interviewerId, videoId],
+        );
+        approvedAt = updateRows[0]!.approved_at;
+      } catch (err) {
+        if ((err as { code?: string } | null)?.code === '23505') {
+          throw new ConflictError('candidate already has an approved video', 'ALREADY_APPROVED');
+        }
+        throw err;
+      }
+
+      await client.query('COMMIT');
+      logger.info({ meetingId, videoId, interviewerId }, 'video approved');
+      return { approvedAt: approvedAt.toISOString() };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;

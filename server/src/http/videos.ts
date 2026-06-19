@@ -6,7 +6,7 @@ import type { MeetingService } from '../domain/MeetingService.js';
 import { canViewMeeting } from '../policy/canViewMeeting.js';
 import { supabaseAdmin } from '../lib/supabase.js';
 import { newId } from '../lib/ids.js';
-import { NotFoundError } from '../lib/errors.js';
+import { NotFoundError, ForbiddenError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 
 const BUCKET = 'interview-videos';
@@ -44,6 +44,15 @@ export function createVideosRouter(meetingService: MeetingService, pool: Pool): 
       if (!canViewMeeting(req.user!, meeting)) {
         res.status(403).json({ error: 'Access denied', code: 'FORBIDDEN' });
         return;
+      }
+
+      const { rows: approvedRows } = await pool.query(
+        `SELECT 1 FROM meeting_videos WHERE candidate_id = $1
+           AND approved_at IS NOT NULL LIMIT 1`,
+        [meeting.candidateId],
+      );
+      if (approvedRows.length > 0) {
+        throw new ForbiddenError('Video already approved; uploads locked', 'VIDEO_APPROVED_LOCKED');
       }
 
       const parsed = uploadUrlBodySchema.safeParse(req.body);
@@ -84,6 +93,15 @@ export function createVideosRouter(meetingService: MeetingService, pool: Pool): 
       if (!canViewMeeting(req.user!, meeting)) {
         res.status(403).json({ error: 'Access denied', code: 'FORBIDDEN' });
         return;
+      }
+
+      const { rows: approvedRows } = await pool.query(
+        `SELECT 1 FROM meeting_videos WHERE candidate_id = $1
+           AND approved_at IS NOT NULL LIMIT 1`,
+        [meeting.candidateId],
+      );
+      if (approvedRows.length > 0) {
+        throw new ForbiddenError('Video already approved; uploads locked', 'VIDEO_APPROVED_LOCKED');
       }
 
       const parsed = saveVideoBodySchema.safeParse(req.body);

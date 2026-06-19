@@ -36,6 +36,9 @@ export default function useVideoResume({
     });
     if (!urlRes.ok) {
       const body = await urlRes.json().catch(() => ({}));
+      if (body.code === 'VIDEO_APPROVED_LOCKED') {
+        throw new Error("This candidate's video has been approved. No further uploads are allowed.");
+      }
       throw new Error(body.error ?? 'Failed to get upload URL');
     }
     const { uploadUrl, storagePath } = await urlRes.json();
@@ -63,6 +66,9 @@ export default function useVideoResume({
     });
     if (!saveRes.ok) {
       const body = await saveRes.json().catch(() => ({}));
+      if (body.code === 'VIDEO_APPROVED_LOCKED') {
+        throw new Error("This candidate's video has been approved. No further uploads are allowed.");
+      }
       throw new Error(body.error ?? 'Failed to save video metadata');
     }
     const { videoId } = await saveRes.json();

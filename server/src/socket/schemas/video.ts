@@ -12,3 +12,8 @@ export const videoSyncSchema = z.object({
   videoId:     uuid,
   currentTime: z.number().nonnegative().finite(),
 });
+
+export const approveVideoSchema = z.object({
+  meetingId: uuid,
+  videoId:   uuid,
+});

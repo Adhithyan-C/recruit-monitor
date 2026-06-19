@@ -4,6 +4,7 @@ import type { MeetingStatus, EndReason } from '../domain/meetingMachine.js';
 import type { SegmentRow, NoteRow } from '../domain/TranscriptService.js';
 import type { SessionRecord } from '../domain/SessionService.js';
 import type { QueuedCandidate } from '../domain/PresenceService.js';
+import type { ActiveVideoDetails } from '../domain/MeetingService.js';
 
 export interface ParticipantUids {
   interviewerUid: number | null;
@@ -42,11 +43,13 @@ interface SharedServerToClientEvents {
     candidateId:     string;
     interviewerId:   string | null;
     participantUids: ParticipantUids;
+    activeVideo?:    ActiveVideoDetails | null;
   }) => void;
   video_available:  (payload: { videoId: string; signedUrl: string; sharedBy: string }) => void;
   video_play_sync:  (payload: { videoId: string; currentTime: number }) => void;
   video_pause_sync: (payload: { videoId: string; currentTime: number }) => void;
   video_seek_sync:  (payload: { videoId: string; currentTime: number }) => void;
+  video_approved:   (payload: { candidateId: string; videoId: string; approvedAt: string; approvedByName: string | null }) => void;
 }
 
 // Staff (interviewer + supervisor) only — candidates never receive note events.
@@ -70,6 +73,7 @@ export interface InterviewerClientToServerEvents {
   video_play:       (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
   video_pause:      (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
   video_seek:       (payload: { meetingId: string; videoId: string; currentTime: number }) => void;
+  approve_video:    (payload: { meetingId: string; videoId: string }, ack: (r: Ack) => void) => void;
 }
 
 export interface InterviewerServerToClientEvents extends StaffServerToClientEvents {
@@ -149,7 +153,7 @@ export interface SupervisorClientToServerEvents {
   subscribe_active_meetings: (ack: (r: Ack<{ meetings: ActiveMeetingInfo[] }>) => void) => void;
   join_room: (
     payload: { meetingId: string },
-    ack: (r: Ack<{ agoraToken: string; agoraChannel: string; uid: number; segments: SegmentRow[]; notes: NoteRow[]; participantUids: ParticipantUids }>) => void,
+    ack: (r: Ack<{ agoraToken: string; agoraChannel: string; uid: number; segments: SegmentRow[]; notes: NoteRow[]; participantUids: ParticipantUids; activeVideo: ActiveVideoDetails | null }>) => void,
   ) => void;
 }
 

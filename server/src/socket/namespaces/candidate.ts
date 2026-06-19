@@ -95,6 +95,9 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
           role: 'publisher',
         });
 
+        const activeVideo = await meetingService.getActiveVideoForCandidate(currentMeeting.candidateId)
+          .catch((err) => { logger.error({ err, meetingId: currentMeeting.id }, 'getActiveVideoForCandidate failed'); return null; });
+
         socket.emit('meeting_attached', {
           meetingId:     currentMeeting.id,
           status,
@@ -109,6 +112,7 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
               : null,
             candidateUid: AgoraTokenService.deriveUid(currentMeeting.id, currentMeeting.candidateId),
           },
+          activeVideo,
         });
 
         attachedMeeting = true;
@@ -176,6 +180,9 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
           candidateUid:   AgoraTokenService.deriveUid(meetingId, userId),
         };
 
+        const activeVideo = await meetingService.getActiveVideoForCandidate(userId)
+          .catch((err) => { logger.error({ err, meetingId }, 'getActiveVideoForCandidate failed'); return null; });
+
         socket.emit('meeting_attached', {
           meetingId,
           status:        'open',
@@ -185,6 +192,7 @@ export function registerCandidateNamespace(io: Server, deps: CandidateDeps): voi
           candidateId:   userId,
           interviewerId: null,
           participantUids,
+          activeVideo,
         });
 
         // Notify interviewer dashboards — fire-and-forget, must not block the ack.
